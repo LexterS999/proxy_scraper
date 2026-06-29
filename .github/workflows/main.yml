@@ -31,6 +31,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.github.com"
-          git add output.txt top30.txt history.json secret.key geo_cache.db
+          # Добавляем только существующие файлы
+          for file in output.txt top30.txt history.json secret.key geo_cache.db; do
+            if [ -f "$file" ]; then
+              git add "$file"
+            fi
+          done
           git diff --staged --quiet || git commit -m "Update proxy lists and history [skip ci]"
           git push
