@@ -36,6 +36,7 @@ import tempfile
 import time
 import traceback
 import uuid
+import ipaddress  # <-- исправлено: добавлен импорт
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
@@ -49,7 +50,7 @@ import aiohttp_socks
 import httpx
 import uvloop
 from cryptography.fernet import Fernet
-from pydantic import BaseModel, Field, ValidationError, validator
+from pydantic import BaseModel, Field, ValidationError, field_validator  # <-- исправлено: импорт field_validator
 import yaml
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -153,13 +154,15 @@ class ProxyParsed(BaseModel):
     params: Dict[str, Union[str, List[str]]] = Field(default_factory=dict)
     uri: str
 
-    @validator('port')
+    @field_validator('port')  # <-- исправлено: @validator → @field_validator
+    @classmethod
     def port_valid(cls, v):
         if not 1 <= v <= 65535:
             raise ValueError('порт вне диапазона')
         return v
 
-    @validator('host')
+    @field_validator('host')  # <-- исправлено: @validator → @field_validator
+    @classmethod
     def host_valid(cls, v):
         if not v or v in ('0.0.0.0', '127.0.0.1', 'localhost'):
             raise ValueError('недопустимый хост')
@@ -947,11 +950,8 @@ async def multi_round_http_check_async(proxy: ProxyParsed, socks_port: int) -> O
     success_rate = sum(all_results) / len(all_results) if all_results else 0.0
     if success_rate >= HTTP_SUCCESS_THRESHOLD and all_latencies:
         median_lat = statistics.median(all_latencies)
-        proxy.http_latency_ms = median_lat  # добавляем атрибут, но ProxyParsed неизменяем, так что используем словарь?
-        # Мы будем хранить в отдельном словаре, но проще использовать mutable объект.
-        # Вместо этого мы создадим копию с дополнительными полями.
-        # Для удобства будем использовать обычный словарь для результатов.
-        # Пока оставим как есть, позже адаптируем.
+        # Добавляем поля в объект (используем setattr, т.к. модель неизменяема)
+        setattr(proxy, 'http_latency_ms', median_lat)
         return proxy
     return None
 
@@ -1015,12 +1015,10 @@ async def tcp_check(proxy: ProxyParsed):
     ok, lat = await tcp_connect_with_retry(proxy.host, proxy.port)
     if not ok:
         return None
-    # Добавляем поля в объект (используем словарь, чтобы потом преобразовать)
-    proxy.tcp_latency_ms = lat  # ProxyParsed не позволяет, но мы можем сделать его изменяемым? Лучше использовать dict.
-    # Мы будем хранить все в словарях. Упростим: будем использовать словари вместо моделей для проверки.
+    setattr(proxy, 'tcp_latency_ms', lat)
     sr, jit = await stress_test_jitter(proxy.host, proxy.port)
-    proxy.stress_success_rate = sr
-    proxy.jitter_ms = jit
+    setattr(proxy, 'stress_success_rate', sr)
+    setattr(proxy, 'jitter_ms', jit)
     return proxy
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1406,7 +1404,7 @@ async def check_all_proxies(proxies: List[ProxyParsed], singbox_path: str) -> Li
 
     # Вычисляем score
     for p in alive:
-        p.score = compute_score(p)
+        setattr(p, 'score', compute_score(p))
     return alive
 
 async def config_is_valid_async(proxy: ProxyParsed, singbox_path: str) -> bool:
@@ -1509,7 +1507,7 @@ async def main_async():
         geo = geo_data.get(p.host, {})
         country_code = geo.get("country_code", "XX")
         country = geo.get("country", "Unknown")
-        score = p.score if hasattr(p, 'score') else 0
+        score = getattr(p, 'score', 0)
         flag = country_to_flag(country_code)
         remark = f"{flag} {country} | 🔒{score}"
         uri = rewrite_uri_fragment(p.uri, remark)
