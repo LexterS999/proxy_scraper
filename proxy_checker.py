@@ -27,6 +27,7 @@ import logging
 import os
 import random
 import re
+import shutil
 import signal
 import socket
 import ssl
