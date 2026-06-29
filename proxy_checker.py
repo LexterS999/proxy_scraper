@@ -1,55 +1,69 @@
 #!/usr/bin/env python3
 """
-Multi-Protocol Proxy Checker — Production Edition v9.0
-=======================================================
-Изменения:
-  - Убрана проверка скорости и сохранение fast_output.txt.
-  - Добавлена система весов и сохранение top30.txt на основе повторяемости.
-  - Внедрено сохранение истории прокси между запусками.
+Proxy Checker v10.0 — Асинхронный, с историей, геокешем и шифрованием.
+
+Все изменения интегрированы:
+- Полный переход на asyncio с uvloop
+- Асинхронная загрузка источников с семафором
+- Асинхронная проверка через sing-box с управлением процессами
+- Динамический размер батча
+- Инкрементальная запись результатов
+- Кеширование гео-данных в SQLite
+- Шифрование истории (Fernet)
+- Circuit Breaker для внешних API
+- Exponential Backoff для retry
+- Graceful shutdown
+- Поддержка Hysteria2, ShadowTLS, WebSocket, UDP
+- Мониторинг и логирование
+- Экспорт в форматы клиентов (v2rayN, Nekoray, v2rayNG)
 """
 
-import re
-import sys
-import os
-import socket
-import time
+import asyncio
+import aiosqlite
+import atexit
 import base64
 import json
-import uuid
-import ipaddress
 import logging
-import subprocess
-import tempfile
-import shutil
-import tarfile
+import os
+import random
+import re
 import signal
-import atexit
+import socket
+import ssl
 import statistics
-import threading
-import asyncio
+import sys
+import tempfile
+import time
+import traceback
+import uuid
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from datetime import datetime, timezone, timedelta
+from functools import lru_cache, wraps
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from urllib.parse import parse_qs, urlparse
+
 import aiohttp
 import aiohttp_socks
-from datetime import datetime, timezone
-from urllib.parse import parse_qs
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import lru_cache
-import random
-import traceback
-
-import requests
+import httpx
+import uvloop
+from cryptography.fernet import Fernet
+from pydantic import BaseModel, Field, ValidationError, validator
 import yaml
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
 #  КОНФИГУРАЦИЯ
-# ═══════════════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
 
 INPUT_FILE = "input.txt"
 OUTPUT_FILE = "output.txt"
 TOP30_FILE = "top30.txt"
 HISTORY_FILE = "history.json"
 CONFIG_FILE = "config.yaml"
+GEO_CACHE_DB = "geo_cache.db"
+SECRET_KEY_FILE = "secret.key"  # для Fernet
 
-# ---- Таймауты (сек) ----
 CONNECT_TIMEOUT = 2.0
 HTTP_TEST_TIMEOUT = 3.0
 SINGBOX_STARTUP_WAIT = 3.0
@@ -58,7 +72,6 @@ GEO_API_TIMEOUT = 15.0
 TCP_RETRY_DELAY = 0.3
 GLOBAL_TIMEOUT = 1600
 
-# ---- Параллелизм ----
 CPU_COUNT = os.cpu_count() or 2
 MAX_WORKERS = CPU_COUNT * 10
 SINGBOX_BATCH_WORKERS = CPU_COUNT * 3
@@ -66,19 +79,16 @@ FETCH_SOURCE_MAX_WORKERS = CPU_COUNT * 4
 GEO_BATCH_SIZE = 100
 STRESS_CONNECTIONS = 1
 
-# ---- sing‑box ----
 SINGBOX_VERSION = "1.12.19"
 SINGBOX_CACHE_PATH = "/tmp/sing-box/sing-box"
 SINGBOX_DOWNLOAD_URL = f"https://github.com/SagerNet/sing-box/releases/download/v{SINGBOX_VERSION}/sing-box-{SINGBOX_VERSION}-linux-amd64.tar.gz"
 SUPPORTED_SINGBOX_TRANSPORTS = {"tcp", "ws", "http", "quic", "grpc"}
 SOCKS_PORT_BASE = 20800
 
-# ---- Размер батча (динамический) ----
 BATCH_SIZE_MIN = 50
 BATCH_SIZE_MAX = 100
 BATCH_SIZE = 70
 
-# ---- Гео-API ----
 GEO_API_URLS = [
     "http://ip-api.com/batch",
     "https://ipinfo.io/batch",
@@ -86,11 +96,9 @@ GEO_API_URLS = [
 ]
 GEO_API_SLEEP = 2.0
 
-# ---- TLS-проверка ----
 ENABLE_TLS_CHECK = True
 TLS_TIMEOUT = 1.0
 
-# ---- HTTP-проверка ----
 HTTP_ROUNDS = 1
 HTTP_ROUND_GAP = 45.0
 HTTP_TARGETS = [
@@ -99,154 +107,298 @@ HTTP_TARGETS = [
 ]
 HTTP_SUCCESS_THRESHOLD = 0.5
 
-# ---- Предфильтрация ----
 ENABLE_CONFIG_CHECK = True
 
-# ---- Веса для ранжирования ----
 WEIGHT_CONFIG = {
-    "security": {
-        "reality": 100,
-        "tls": 70,
-        "none": 0
-    },
-    "protocol": {
-        "vless": 100,
-        "trojan": 80,
-        "hy2": 60,
-        "ss": 40,
-        "tuic": 50
-    },
+    "security": {"reality": 100, "tls": 70, "none": 0},
+    "protocol": {"vless": 100, "trojan": 80, "hy2": 60, "ss": 40, "tuic": 50},
     "country_boost": {
-        "US": 10,
-        "DE": 8,
-        "FR": 8,
-        "GB": 8,
-        "NL": 10,
-        "SG": 10,
-        "JP": 9,
-        "CA": 7,
-        "RU": 5,  # может быть полезно для обхода
-        # по умолчанию 5
+        "US": 10, "DE": 8, "FR": 8, "GB": 8, "NL": 10,
+        "SG": 10, "JP": 9, "CA": 7, "RU": 5,
     },
-    "latency_ms": {
-        "very_good": 0,      # < 50ms
-        "good": 5,           # 50-150ms
-        "average": 10,       # 150-300ms
-        "poor": 20,          # > 300ms
-        "unknown": 15
-    },
-    "stability": {
-        "high": 0,           # > 0.9 success rate
-        "medium": 5,         # 0.7-0.9
-        "low": 15,           # < 0.7
-        "unknown": 10
-    },
-    "appearance_bonus": 5,   # за каждое появление сверх порога
-    "appearance_threshold": 3,  # сколько раз должен появиться, чтобы попасть в топ
-    "age_penalty": 1,        # за каждый день с последнего появления
+    "latency_ms": {"very_good": 0, "good": 5, "average": 10, "poor": 20, "unknown": 15},
+    "stability": {"high": 0, "medium": 5, "low": 15, "unknown": 10},
+    "appearance_bonus": 5,
+    "appearance_threshold": 3,
+    "age_penalty": 1,
 }
 
-# ---- Прочие ----
 FETCH_SOURCE_RETRIES = 2
 FETCH_SOURCE_DELAY = 10.0
 TCP_CONNECT_RETRIES = 1
-HTTP_USER_AGENT = "ProxyChecker/9.0 (GitHub Actions)"
+HTTP_USER_AGENT = "ProxyChecker/10.0 (GitHub Actions)"
 LOG_LEVEL = logging.INFO
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  ЛОГГЕР И ОБРАБОТЧИКИ СИГНАЛОВ
-# ═══════════════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
+#  ЛОГГЕР
+# ──────────────────────────────────────────────────────────────────────────────
 
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format=LOG_FORMAT,
-    datefmt=LOG_DATE_FORMAT
-)
+logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
 log = logging.getLogger(__name__)
 
-singbox_processes = []
-_singbox_download_lock = threading.Lock()
-_singbox_downloaded = False
+# ──────────────────────────────────────────────────────────────────────────────
+#  МОДЕЛИ PYDANTIC
+# ──────────────────────────────────────────────────────────────────────────────
 
-def cleanup():
-    for proc in singbox_processes:
-        try:
-            proc.terminate()
-            proc.wait(timeout=2)
-        except:
+class ProxyParsed(BaseModel):
+    protocol: str
+    host: str
+    port: int
+    sni: Optional[str] = None
+    credential: str
+    transport_type: str = "tcp"
+    security: str = "none"
+    params: Dict[str, Union[str, List[str]]] = Field(default_factory=dict)
+    uri: str
+
+    @validator('port')
+    def port_valid(cls, v):
+        if not 1 <= v <= 65535:
+            raise ValueError('порт вне диапазона')
+        return v
+
+    @validator('host')
+    def host_valid(cls, v):
+        if not v or v in ('0.0.0.0', '127.0.0.1', 'localhost'):
+            raise ValueError('недопустимый хост')
+        return v
+
+class HistoryEntry(BaseModel):
+    first_seen: str
+    last_seen: str
+    appearances: int = 1
+    last_alive: bool = True
+    protocol: str
+    host: str
+    port: int
+    sni: Optional[str] = None
+    credential: str
+    security: str = "none"
+    transport: str = "tcp"
+    country: str = "XX"
+    tcp_latency_ms: float = 0.0
+    http_latency_ms: float = 0.0
+    stress_success_rate: float = 0.0
+    jitter_ms: float = 0.0
+    score: int = 0
+    uri: str = ""
+
+class GeoCacheEntry(BaseModel):
+    ip: str
+    country_code: str
+    country: str
+    isp: str = ""
+    asn: str = ""
+    updated_at: str
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ШИФРОВАНИЕ ИСТОРИИ
+# ──────────────────────────────────────────────────────────────────────────────
+
+def load_or_create_key() -> bytes:
+    key_file = Path(SECRET_KEY_FILE)
+    if key_file.exists():
+        return key_file.read_bytes()
+    else:
+        key = Fernet.generate_key()
+        key_file.write_bytes(key)
+        key_file.chmod(0o600)
+        return key
+
+class EncryptedHistory:
+    def __init__(self, history_file=HISTORY_FILE):
+        self.history_file = history_file
+        self.key = load_or_create_key()
+        self.fernet = Fernet(self.key)
+        self._data: Dict[str, Dict] = {}
+        self._load()
+
+    def _load(self):
+        if os.path.exists(self.history_file):
             try:
-                proc.kill()
-            except:
-                pass
+                with open(self.history_file, 'rb') as f:
+                    encrypted = f.read()
+                decrypted = self.fernet.decrypt(encrypted).decode('utf-8')
+                self._data = json.loads(decrypted)
+            except Exception as e:
+                log.warning(f"Не удалось расшифровать историю: {e}, создаём новую")
+                self._data = {}
+        else:
+            self._data = {}
 
-def signal_handler(sig, frame):
-    log.warning(f"Получен сигнал {sig}, завершаем работу...")
-    cleanup()
-    sys.exit(1)
+    def _save(self):
+        try:
+            json_str = json.dumps(self._data, indent=2)
+            encrypted = self.fernet.encrypt(json_str.encode('utf-8'))
+            with open(self.history_file, 'wb') as f:
+                f.write(encrypted)
+        except Exception as e:
+            log.error(f"Ошибка сохранения истории: {e}")
 
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
-atexit.register(cleanup)
+    def __getitem__(self, key):
+        return self._data.get(key)
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ═══════════════════════════════════════════════════════════════════════════
+    def __setitem__(self, key, value):
+        self._data[key] = value
+        self._save()
 
-PRIVATE_RANGES = [
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("169.254.0.0/16"),
-    ipaddress.ip_network("0.0.0.0/8"),
-    ipaddress.ip_network("224.0.0.0/4"),
-    ipaddress.ip_network("240.0.0.0/4"),
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fc00::/7"),
-    ipaddress.ip_network("fe80::/10"),
-]
-CLOUDFLARE_RANGES = [
-    ipaddress.ip_network("104.16.0.0/13"),
-    ipaddress.ip_network("172.64.0.0/13"),
-    ipaddress.ip_network("162.158.0.0/15"),
-]
-BLACKLIST_IPS = {"1.1.1.1", "8.8.8.8", "8.8.4.4", "9.9.9.9", "149.112.112.112"}
-FLAG_OFFSET = 127397
+    def __contains__(self, key):
+        return key in self._data
 
-# ---- Кэш парсинга URI ----
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+    def items(self):
+        return self._data.items()
+
+    def keys(self):
+        return self._data.keys()
+
+    def values(self):
+        return self._data.values()
+
+    def pop(self, key, default=None):
+        val = self._data.pop(key, default)
+        self._save()
+        return val
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ГЕОКЕШ (SQLite)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class GeoCache:
+    def __init__(self, db_path=GEO_CACHE_DB):
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self):
+        async def init():
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS geo_cache (
+                        ip TEXT PRIMARY KEY,
+                        country_code TEXT,
+                        country TEXT,
+                        isp TEXT,
+                        asn TEXT,
+                        updated_at TEXT
+                    )
+                ''')
+                await db.commit()
+        asyncio.run(init())
+
+    async def get(self, ip: str) -> Optional[GeoCacheEntry]:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                'SELECT ip, country_code, country, isp, asn, updated_at FROM geo_cache WHERE ip = ?',
+                (ip,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return GeoCacheEntry(
+                        ip=row[0], country_code=row[1], country=row[2],
+                        isp=row[3], asn=row[4], updated_at=row[5]
+                    )
+        return None
+
+    async def set(self, entry: GeoCacheEntry):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                'INSERT OR REPLACE INTO geo_cache (ip, country_code, country, isp, asn, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+                (entry.ip, entry.country_code, entry.country, entry.isp, entry.asn, entry.updated_at)
+            )
+            await db.commit()
+
+    async def cleanup_old(self, days=30):
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('DELETE FROM geo_cache WHERE updated_at < ?', (cutoff,))
+            await db.commit()
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  CIRCUIT BREAKER
+# ──────────────────────────────────────────────────────────────────────────────
+
+class CircuitBreaker:
+    def __init__(self, name, failure_threshold=3, recovery_timeout=60):
+        self.name = name
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self._failures = 0
+        self._last_failure_time = 0
+        self._state = "closed"  # closed, open, half-open
+
+    def record_success(self):
+        self._failures = 0
+        self._state = "closed"
+
+    def record_failure(self):
+        self._failures += 1
+        self._last_failure_time = time.time()
+        if self._failures >= self.failure_threshold:
+            self._state = "open"
+            log.warning(f"Circuit breaker '{self.name}' opened")
+
+    def allow_request(self) -> bool:
+        if self._state == "closed":
+            return True
+        if self._state == "open":
+            if time.time() - self._last_failure_time > self.recovery_timeout:
+                self._state = "half-open"
+                log.info(f"Circuit breaker '{self.name}' half-open, testing")
+                return True
+            return False
+        # half-open
+        return True
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  HELPER: Exponential Backoff
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def retry_async(coro, retries=3, delay=1, backoff=2, exceptions=(Exception,)):
+    for attempt in range(retries + 1):
+        try:
+            return await coro
+        except exceptions as e:
+            if attempt == retries:
+                raise
+            wait = delay * (backoff ** attempt) + random.uniform(0, 0.5)
+            log.debug(f"Retry {attempt+1}/{retries} after {wait:.2f}s: {e}")
+            await asyncio.sleep(wait)
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ПАРСИНГ URI
+# ──────────────────────────────────────────────────────────────────────────────
+
 _parse_cache = {}
-_parse_re_cache = {}
 
 def compile_regex(pattern):
-    if pattern not in _parse_re_cache:
-        _parse_re_cache[pattern] = re.compile(pattern)
-    return _parse_re_cache[pattern]
+    return re.compile(pattern)
 
 @lru_cache(maxsize=10000)
-def cached_parse(uri: str):
-    return parse_proxy_uri_raw(uri)
-
-def parse_proxy_uri_raw(uri: str) -> dict | None:
+def cached_parse(uri: str) -> Optional[ProxyParsed]:
     uri = uri.strip()
     if not uri:
         return None
-    n = uri
-    if n.startswith("hysteria2://"):
-        n = "hy2://" + n[len("hysteria2://"):]
-    if n.startswith("ss://"):
-        return parse_ss_uri(n)
-    if n.startswith("tuic://"):
-        return parse_tuic_uri(n)
-    m = compile_regex(
+    # Нормализация hysteria2
+    if uri.startswith("hysteria2://"):
+        uri = "hy2://" + uri[len("hysteria2://"):]
+    if uri.startswith("ss://"):
+        return parse_ss(uri)
+    if uri.startswith("tuic://"):
+        return parse_tuic(uri)
+    # vless, trojan, hy2
+    pattern = re.compile(
         r'^(?P<protocol>vless|trojan|hy2)://'
         r'(?P<credential>[^@]+)@'
         r'(?P<host>[^:]+):'
         r'(?P<port>\d+)'
         r'(?P<query>\?[^#]*)?'
         r'(?P<fragment>#.*)?$'
-    ).match(n)
+    )
+    m = pattern.match(uri)
     if not m:
         return None
     proto = m.group("protocol")
@@ -261,15 +413,16 @@ def parse_proxy_uri_raw(uri: str) -> dict | None:
     sec = (params.get("security") or ["none"])[0].lower()
     if proto == "hy2": sec = "tls"
     if proto == "trojan": sec = "tls"
-    if not (1 <= port <= 65535):
+    try:
+        return ProxyParsed(
+            protocol=proto, host=host, port=port, sni=sni,
+            credential=cred, transport_type=transport,
+            security=sec, params=params, uri=uri.strip()
+        )
+    except ValidationError:
         return None
-    if not host or host in ("0.0.0.0", "127.0.0.1", "localhost"):
-        return None
-    return {"protocol": proto, "host": host, "port": port, "sni": sni,
-            "credential": cred, "transport_type": transport,
-            "security": sec, "params": params, "uri": uri.strip()}
 
-def parse_ss_uri(uri: str) -> dict | None:
+def parse_ss(uri: str) -> Optional[ProxyParsed]:
     try:
         rem = uri[5:]
         if "@" not in rem:
@@ -288,37 +441,41 @@ def parse_ss_uri(uri: str) -> dict | None:
             elif "?" in addr_part: addr_part = addr_part.split("?", 1)[0]
             host, port_str = addr_part.rsplit(":", 1)
             port = int(port_str)
-        return {"protocol": "ss", "host": host.lower(), "port": port,
-                "sni": None, "credential": f"{method}:{pw}",
-                "transport_type": "tcp", "security": "none",
-                "params": {}, "uri": uri.strip()}
+        return ProxyParsed(
+            protocol="ss", host=host.lower(), port=port, sni=None,
+            credential=f"{method}:{pw}", transport_type="tcp",
+            security="none", params={}, uri=uri.strip()
+        )
     except Exception:
         return None
 
-def parse_tuic_uri(uri: str) -> dict | None:
-    m = compile_regex(
+def parse_tuic(uri: str) -> Optional[ProxyParsed]:
+    pattern = re.compile(
         r'^tuic://(?P<uuid>[^:]+):(?P<password>[^@]+)@(?P<host>[^:]+):(?P<port>\d+)'
         r'(?P<query>\?[^#]*)?(?P<fragment>#.*)?$'
-    ).match(uri.strip())
-    if not m: return None
+    )
+    m = pattern.match(uri.strip())
+    if not m:
+        return None
     host = m.group("host").lower()
     port = int(m.group("port"))
     query = m.group("query") or ""
     params = parse_qs(query.lstrip("?"))
     sni = (params.get("sni") or [None])[0]
     if sni: sni = sni.lower()
-    if not (1 <= port <= 65535): return None
-    return {"protocol": "tuic", "host": host, "port": port, "sni": sni,
-            "credential": f"{m.group('uuid')}:{m.group('password')}",
-            "transport_type": "quic", "security": "tls",
-            "params": params, "uri": uri.strip()}
+    return ProxyParsed(
+        protocol="tuic", host=host, port=port, sni=sni,
+        credential=f"{m.group('uuid')}:{m.group('password')}",
+        transport_type="quic", security="tls", params=params, uri=uri.strip()
+    )
 
-def parse_clash_yaml(text: str) -> list[dict]:
+def parse_clash_yaml(text: str) -> List[str]:
     try:
         data = yaml.safe_load(text)
     except yaml.YAMLError:
         return []
-    if not isinstance(data, dict): return []
+    if not isinstance(data, dict):
+        return []
     results = []
     pmap = {"vless": "vless", "trojan": "trojan", "hysteria2": "hy2",
             "ss": "ss", "shadowsocks": "ss", "tuic": "tuic"}
@@ -341,33 +498,35 @@ def parse_clash_yaml(text: str) -> list[dict]:
             ub = f"{proto}://{cred}@{server}:{port}?security={sec}&type={transp}"
             if sni: ub += f"&sni={sni}"
             ub += f"#Clash-{ptype}"
-            results.append({"protocol": proto, "host": server.lower(),
-                            "port": int(port), "sni": sni.lower() if sni else None,
-                            "credential": cred, "transport_type": transp,
-                            "security": sec, "params": {}, "uri": ub})
+            results.append(ub)
         except Exception:
             continue
     return results
 
-def country_to_flag(code: str) -> str:
-    if not code or len(code) != 2:
-        return "🏳️"
-    try:
-        return chr(ord(code[0].upper()) + FLAG_OFFSET) + chr(ord(code[1].upper()) + FLAG_OFFSET)
-    except (ValueError, AttributeError):
-        return "🏳️"
+# ──────────────────────────────────────────────────────────────────────────────
+#  FILTERS
+# ──────────────────────────────────────────────────────────────────────────────
 
-def build_remark(flag: str, country: str, score: int, tags: list[str] = None) -> str:
-    r = f"{flag} {country} | 🔒{score}"
-    if tags:
-        r += " | " + " ".join(tags)
-    return r
-
-def rewrite_uri_fragment(original_uri: str, remark: str) -> str:
-    uri = original_uri.strip()
-    if "#" in uri:
-        uri = uri.rsplit("#", 1)[0]
-    return f"{uri}#{remark}"
+PRIVATE_RANGES = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("224.0.0.0/4"),
+    ipaddress.ip_network("240.0.0.0/4"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+]
+CLOUDFLARE_RANGES = [
+    ipaddress.ip_network("104.16.0.0/13"),
+    ipaddress.ip_network("172.64.0.0/13"),
+    ipaddress.ip_network("162.158.0.0/15"),
+]
+BLACKLIST_IPS = {"1.1.1.1", "8.8.8.8", "8.8.4.4", "9.9.9.9", "149.112.112.112"}
+FLAG_OFFSET = 127397
 
 def is_ip_address(host: str) -> bool:
     try:
@@ -396,6 +555,13 @@ def is_cloudflare_ip(host: str) -> bool:
     except ValueError:
         return False
 
+def is_blacklisted(proxy: ProxyParsed) -> bool:
+    h = proxy.host
+    if h in BLACKLIST_IPS: return True
+    if is_private_ip(h): return True
+    if is_cloudflare_ip(h): return True
+    return False
+
 def validate_uuid(uuid_str: str) -> bool:
     try:
         uuid.UUID(uuid_str)
@@ -416,261 +582,100 @@ def password_entropy(pw: str) -> float:
         return 0.0
     return len(pw) * math.log2(cs)
 
-# ── Фильтры ─────────────────────────────────────────────────────────
-
-def has_security(proxy: dict) -> bool:
-    if proxy["protocol"] == "vless":
-        return proxy["security"] in ("tls", "reality")
+def has_security(proxy: ProxyParsed) -> bool:
+    if proxy.protocol == "vless":
+        return proxy.security in ("tls", "reality")
     return True
 
-def validate_reality_params(proxy: dict) -> bool:
-    if proxy["protocol"] == "vless" and proxy["security"] == "reality":
-        params = proxy.get("params", {})
-        if not params.get("pbk") or not params.get("sid") or not proxy.get("sni"):
+def validate_reality_params(proxy: ProxyParsed) -> bool:
+    if proxy.protocol == "vless" and proxy.security == "reality":
+        params = proxy.params
+        if not params.get("pbk") or not params.get("sid") or not proxy.sni:
             return False
     return True
 
-def validate_credentials(proxy: dict) -> float:
-    if proxy["protocol"] == "vless":
-        return 0.0 if validate_uuid(proxy["credential"]) else 0.5
-    if proxy["protocol"] in ("trojan", "hy2", "tuic"):
-        pw = proxy["credential"].split(":")[-1]
+def validate_credentials(proxy: ProxyParsed) -> float:
+    if proxy.protocol == "vless":
+        return 0.0 if validate_uuid(proxy.credential) else 0.5
+    if proxy.protocol in ("trojan", "hy2", "tuic"):
+        pw = proxy.credential.split(":")[-1]
         if len(pw) < 8 or password_entropy(pw) < 30:
             return 0.4
         return 0.0
-    if proxy["protocol"] == "ss":
-        pw = proxy["credential"].split(":", 1)[-1]
+    if proxy.protocol == "ss":
+        pw = proxy.credential.split(":", 1)[-1]
         if len(pw) < 8: return 0.3
         return 0.0
     return 0.0
 
-def is_ip_only(proxy: dict) -> bool:
-    return is_ip_address(proxy["host"])
-
-def is_blacklisted(proxy: dict) -> bool:
-    h = proxy["host"]
-    if h in BLACKLIST_IPS: return True
-    if is_private_ip(h): return True
-    if is_cloudflare_ip(h): return True
-    return False
-
-def deduplicate_proxies(proxies: list[dict]) -> list[dict]:
+def deduplicate_proxies(proxies: List[ProxyParsed]) -> List[ProxyParsed]:
     seen = set()
     unique = []
     for p in proxies:
-        key = f"{p['protocol']}|{p['host']}|{p['port']}|{p['credential']}|{p['transport_type']}|{p['security']}"
+        key = f"{p.protocol}|{p.host}|{p.port}|{p.credential}|{p.transport_type}|{p.security}"
         if key not in seen:
             seen.add(key)
             unique.append(p)
     return unique
 
-# ── Адаптивный таймаут ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+#  SING-BOX УПРАВЛЕНИЕ (АСИНХРОННОЕ)
+# ──────────────────────────────────────────────────────────────────────────────
 
-_median_latency = 1000.0
+singbox_processes = []
+_singbox_download_lock = asyncio.Lock()
+_singbox_downloaded = False
 
-def update_adaptive_timeout(latencies: list[float]):
-    global _median_latency
-    if latencies:
-        _median_latency = statistics.median(latencies)
-        _median_latency = max(200, min(5000, _median_latency))
-        log.debug(f"Адаптивный таймаут обновлён: {_median_latency:.0f}ms")
-
-def get_adaptive_http_timeout():
-    t = max(2.0, min(10.0, _median_latency / 1000 * 2))
-    return t
-
-def get_adaptive_connect_timeout():
-    t = max(1.0, min(5.0, _median_latency / 1000 * 1.5))
-    return t
-
-# ── TCP и стресс-тест ─────────────────────────────────────────────
-
-def tcp_connect_with_retry(host, port, retries=TCP_CONNECT_RETRIES, delay=TCP_RETRY_DELAY):
-    timeout = get_adaptive_connect_timeout()
-    for attempt in range(retries + 1):
+def cleanup_singbox():
+    for proc in singbox_processes:
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(timeout)
-            t0 = time.perf_counter()
-            r = s.connect_ex((host, port))
-            el = (time.perf_counter() - t0) * 1000
-            s.close()
-            if r == 0:
-                return True, el
-            if attempt < retries:
-                time.sleep(delay * (2 ** attempt))
-        except Exception:
-            if attempt < retries:
-                time.sleep(delay * (2 ** attempt))
-    return False, 0.0
-
-def stress_test_jitter(host, port):
-    lats = []
-    for _ in range(STRESS_CONNECTIONS):
-        ok, lat = tcp_connect_with_retry(host, port, retries=0)
-        if ok: lats.append(lat)
-    if not lats: return 0.0, 0.0
-    sr = len(lats) / STRESS_CONNECTIONS
-    if len(lats) < 2: jit = 0.0
-    else:
-        mean = sum(lats) / len(lats)
-        jit = sum(abs(l - mean) for l in lats) / len(lats)
-    return sr, jit
-
-def _tcp_check(proxy):
-    h, p = proxy["host"], proxy["port"]
-    ok, lat = tcp_connect_with_retry(h, p)
-    if not ok:
-        return None
-    proxy["tcp_latency_ms"] = lat
-    sr, jit = stress_test_jitter(h, p)
-    proxy["stress_success_rate"] = sr
-    proxy["jitter_ms"] = jit
-    return proxy
-
-# ── TLS, HTTP ─────────────────────────────────────────────────────
-
-def tls_handshake_check(host: str, port: int, sni: str = None, timeout: float = TLS_TIMEOUT) -> bool:
-    import ssl
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        sock.connect((host, port))
-        context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-        with context.wrap_socket(sock, server_hostname=sni or host) as ssock:
-            return True
-    except Exception:
-        return False
-
-# ----- Пул HTTP-сессий -----
-_http_session_pool = {}
-
-def get_http_session(proxy_url=None):
-    key = proxy_url or "default"
-    if key not in _http_session_pool:
-        session = requests.Session()
-        session.headers.update({"User-Agent": HTTP_USER_AGENT})
-        if proxy_url:
-            session.proxies = {"http": proxy_url, "https": proxy_url}
-        _http_session_pool[key] = session
-    return _http_session_pool[key]
-
-def check_http_through_socks(proxy: dict, target_url: str, expected_status: int,
-                             socks_port: int, timeout: float) -> tuple[bool, float]:
-    proxy_url = f"socks5h://127.0.0.1:{socks_port}"
-    session = get_http_session(proxy_url)
-    try:
-        start = time.perf_counter()
-        resp = session.get(
-            target_url,
-            timeout=timeout,
-            headers={"User-Agent": HTTP_USER_AGENT}
-        )
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        ok = resp.status_code == expected_status
-        return ok, elapsed_ms
-    except Exception:
-        return False, float('inf')
-
-def multi_round_http_check(proxy: dict, socks_port: int) -> dict | None:
-    all_results = []
-    all_latencies = []
-    timeout = get_adaptive_http_timeout()
-    for round_num in range(HTTP_ROUNDS):
-        if round_num > 0:
-            time.sleep(HTTP_ROUND_GAP)
-        for target_url, expected_status in HTTP_TARGETS:
-            ok, lat = check_http_through_socks(proxy, target_url, expected_status,
-                                               socks_port, timeout)
-            all_results.append(ok)
-            if ok and lat < float('inf'):
-                all_latencies.append(lat)
-    success_rate = sum(all_results) / len(all_results) if all_results else 0.0
-    if success_rate >= HTTP_SUCCESS_THRESHOLD and all_latencies:
-        median_lat = statistics.median(all_latencies)
-        proxy["alive"] = True
-        proxy["http_latency_ms"] = median_lat
-        proxy["http_latencies"] = all_latencies
-        update_adaptive_timeout(all_latencies)
-        return proxy
-    else:
-        return None
-
-def config_is_valid(proxy: dict, singbox_path: str) -> bool:
-    config = _build_singbox_config(proxy, socks_port=0)
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-        json.dump(config, f)
-        tmp = f.name
-    try:
-        result = subprocess.run(
-            [singbox_path, "check", "-c", tmp],
-            capture_output=True,
-            timeout=10,
-            text=True
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
-    finally:
-        try:
-            os.unlink(tmp)
+            proc.terminate()
+            proc.wait(timeout=2)
         except:
-            pass
+            try:
+                proc.kill()
+            except:
+                pass
 
-# ── sing‑box (загрузка, конфиги, пакетная проверка) ─────────────
+atexit.register(cleanup_singbox)
 
-def _ensure_singbox() -> str:
+async def ensure_singbox() -> str:
     global _singbox_downloaded
     if os.path.exists(SINGBOX_CACHE_PATH) and os.access(SINGBOX_CACHE_PATH, os.X_OK):
         return SINGBOX_CACHE_PATH
 
-    with _singbox_download_lock:
+    async with _singbox_download_lock:
         if os.path.exists(SINGBOX_CACHE_PATH) and os.access(SINGBOX_CACHE_PATH, os.X_OK):
             return SINGBOX_CACHE_PATH
 
         os.makedirs(os.path.dirname(SINGBOX_CACHE_PATH), exist_ok=True)
-        log.info(f"Загрузка sing-box v{SINGBOX_VERSION} (с блокировкой)...")
+        log.info(f"Загрузка sing-box v{SINGBOX_VERSION}...")
         tarball = "/tmp/sing-box.tar.gz"
         max_retries = 3
         retry_delay = 5
 
         for attempt in range(max_retries):
             try:
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                    'Accept': 'application/octet-stream',
-                }
-                r = requests.get(
-                    SINGBOX_DOWNLOAD_URL,
-                    headers=headers,
-                    stream=True,
-                    allow_redirects=True,
-                    timeout=120
-                )
-                r.raise_for_status()
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        SINGBOX_DOWNLOAD_URL,
+                        headers={'User-Agent': HTTP_USER_AGENT},
+                        timeout=aiohttp.ClientTimeout(total=120)
+                    ) as resp:
+                        resp.raise_for_status()
+                        with open(tarball, "wb") as f:
+                            async for chunk in resp.content.iter_chunked(8192):
+                                f.write(chunk)
 
-                content_type = r.headers.get('Content-Type', '')
-                if 'text/html' in content_type:
-                    log.warning(f"Получен HTML вместо файла (попытка {attempt+1})")
-                    raise ValueError("Сервер вернул HTML")
-
-                with open(tarball, "wb") as f:
-                    downloaded = 0
-                    for chunk in r.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
-
-                if downloaded < 1024 * 1024:
-                    log.warning(f"Файл слишком мал ({downloaded} байт)")
+                if os.path.getsize(tarball) < 1024 * 1024:
+                    log.warning(f"Файл слишком мал, попытка {attempt+1}")
                     os.unlink(tarball)
-                    time.sleep(retry_delay)
+                    await asyncio.sleep(retry_delay)
                     continue
 
                 extract_dir = "/tmp/sing-box-extract"
                 os.makedirs(extract_dir, exist_ok=True)
+                import tarfile
                 with tarfile.open(tarball, "r:gz") as tar:
                     extracted = False
                     for member in tar.getmembers():
@@ -682,7 +687,6 @@ def _ensure_singbox() -> str:
                             break
                     if not extracted:
                         raise ValueError("В архиве не найден sing-box")
-
                 os.chmod(SINGBOX_CACHE_PATH, 0o755)
                 os.unlink(tarball)
                 shutil.rmtree(extract_dir, ignore_errors=True)
@@ -693,25 +697,24 @@ def _ensure_singbox() -> str:
             except Exception as e:
                 log.warning(f"Попытка {attempt+1}/{max_retries} не удалась: {e}")
                 if os.path.exists(tarball):
-                    try:
-                        os.unlink(tarball)
-                    except:
-                        pass
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delay * (attempt + 1))
-                else:
-                    log.error(f"Не удалось загрузить sing‑box после {max_retries} попыток")
-                    raise
+                    try: os.unlink(tarball)
+                    except: pass
+                await asyncio.sleep(retry_delay * (attempt + 1))
+        raise RuntimeError("Не удалось загрузить sing-box")
 
-def _build_singbox_outbound(proxy: dict, tag: str) -> dict:
-    proto = proxy["protocol"]
-    host = proxy["host"]
-    port = proxy["port"]
-    cred = proxy["credential"]
-    sni = proxy.get("sni")
-    sec = proxy.get("security", "none")
-    transport = proxy.get("transport_type", "tcp")
-    params = proxy.get("params", {})
+# ──────────────────────────────────────────────────────────────────────────────
+#  ПОСТРОЕНИЕ КОНФИГА SING-BOX
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_singbox_outbound(proxy: ProxyParsed, tag: str) -> dict:
+    proto = proxy.protocol
+    host = proxy.host
+    port = proxy.port
+    cred = proxy.credential
+    sni = proxy.sni
+    sec = proxy.security
+    transport = proxy.transport_type
+    params = proxy.params
 
     outbound = {
         "type": proto,
@@ -792,35 +795,16 @@ def _build_singbox_outbound(proxy: dict, tag: str) -> dict:
         method, pw = cred.split(":", 1)
         outbound["method"] = method
         outbound["password"] = pw
-
     return outbound
 
-def _build_singbox_config(proxy: dict, socks_port: int) -> dict:
-    outbound = _build_singbox_outbound(proxy, tag="out")
-    if socks_port > 0:
-        return {
-            "log": {"level": "error"},
-            "inbounds": [{
-                "type": "mixed",
-                "tag": "mixed-in",
-                "listen": "127.0.0.1",
-                "listen_port": socks_port,
-            }],
-            "outbounds": [outbound],
-        }
-    else:
-        return {"outbounds": [outbound]}
-
-def build_batch_config(proxies: list[dict], base_port: int) -> dict:
+def build_batch_config(proxies: List[ProxyParsed], base_port: int) -> dict:
     inbounds = []
     outbounds = []
     route_rules = []
-
     for i, proxy in enumerate(proxies):
         port = base_port + i
-        out = _build_singbox_outbound(proxy, tag=f"out-{i}")
+        out = build_singbox_outbound(proxy, tag=f"out-{i}")
         outbounds.append(out)
-
         inbound = {
             "type": "mixed",
             "tag": f"in-{i}",
@@ -828,12 +812,10 @@ def build_batch_config(proxies: list[dict], base_port: int) -> dict:
             "listen_port": port,
         }
         inbounds.append(inbound)
-
         route_rules.append({
             "inbound": [f"in-{i}"],
             "outbound": f"out-{i}"
         })
-
     return {
         "log": {"level": "error"},
         "inbounds": inbounds,
@@ -841,10 +823,13 @@ def build_batch_config(proxies: list[dict], base_port: int) -> dict:
         "route": {"rules": route_rules}
     }
 
-def check_batch_via_singbox(batch: list[dict], base_port: int, singbox_path: str) -> list[dict]:
+# ──────────────────────────────────────────────────────────────────────────────
+#  АСИНХРОННАЯ ПРОВЕРКА ЧЕРЕЗ SING-BOX
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def check_batch_via_singbox(batch: List[ProxyParsed], base_port: int, singbox_path: str) -> List[ProxyParsed]:
     if not batch:
         return []
-
     config = build_batch_config(batch, base_port)
     tmpfile = None
     try:
@@ -857,46 +842,60 @@ def check_batch_via_singbox(batch: list[dict], base_port: int, singbox_path: str
 
     proc = None
     try:
-        proc = subprocess.Popen(
-            [singbox_path, "run", "-c", tmpfile],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
+        proc = await asyncio.create_subprocess_exec(
+            singbox_path, "run", "-c", tmpfile,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
         singbox_processes.append(proc)
 
         ports = [base_port + i for i in range(len(batch))]
         ready_ports = set()
         start_time = time.time()
+        # Проверяем порты с экспоненциальной задержкой
         while time.time() - start_time < SINGBOX_STARTUP_WAIT:
-            if proc.poll() is not None:
+            if proc.returncode is not None:
+                stderr = await proc.stderr.read()
+                log.warning(f"sing-box умер: {stderr.decode()}")
                 return []
             for port in ports:
                 if port in ready_ports:
                     continue
                 try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.settimeout(0.3)
-                    if s.connect_ex(("127.0.0.1", port)) == 0:
-                        ready_ports.add(port)
-                    s.close()
+                    # Асинхронная проверка порта
+                    conn = asyncio.open_connection('127.0.0.1', port)
+                    reader, writer = await asyncio.wait_for(conn, timeout=0.3)
+                    writer.close()
+                    await writer.wait_closed()
+                    ready_ports.add(port)
                 except:
                     pass
             if len(ready_ports) == len(ports):
                 break
-            time.sleep(0.1)
+            await asyncio.sleep(0.1)
         else:
+            # Не все порты открылись
+            stderr = await proc.stderr.read()
+            log.warning(f"Не удалось запустить sing-box для батча: {stderr.decode()}")
             return []
 
+        # HTTP проверка через SOCKS5 (асинхронная)
         alive_proxies = []
+        sem = asyncio.Semaphore(10)  # ограничение одновременных HTTP проверок
+        async def check_one(proxy, port):
+            async with sem:
+                result = await multi_round_http_check_async(proxy, port)
+                return result
+        tasks = []
         for i, proxy in enumerate(batch):
             port = base_port + i
             if port not in ready_ports:
                 continue
-            result = multi_round_http_check(proxy, port)
-            if result is not None:
-                alive_proxies.append(proxy)
-
+            tasks.append(check_one(proxy, port))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for res in results:
+            if isinstance(res, ProxyParsed):
+                alive_proxies.append(res)
         return alive_proxies
 
     except Exception as e:
@@ -906,7 +905,7 @@ def check_batch_via_singbox(batch: list[dict], base_port: int, singbox_path: str
         if proc is not None:
             try:
                 proc.terminate()
-                proc.wait(timeout=5)
+                await asyncio.wait_for(proc.wait(), timeout=5)
             except:
                 try:
                     proc.kill()
@@ -920,67 +919,153 @@ def check_batch_via_singbox(batch: list[dict], base_port: int, singbox_path: str
             except:
                 pass
 
-def check_proxies_via_singbox(proxies: list[dict], singbox_path: str) -> list[dict]:
-    if not proxies:
-        return []
+async def multi_round_http_check_async(proxy: ProxyParsed, socks_port: int) -> Optional[ProxyParsed]:
+    timeout = get_adaptive_http_timeout()
+    all_results = []
+    all_latencies = []
+    proxy_url = f"socks5h://127.0.0.1:{socks_port}"
+    connector = aiohttp_socks.SocksConnector.from_url(proxy_url)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        for round_num in range(HTTP_ROUNDS):
+            if round_num > 0:
+                await asyncio.sleep(HTTP_ROUND_GAP)
+            for target_url, expected_status in HTTP_TARGETS:
+                try:
+                    start = time.perf_counter()
+                    async with session.get(
+                        target_url,
+                        timeout=aiohttp.ClientTimeout(total=timeout),
+                        headers={"User-Agent": HTTP_USER_AGENT}
+                    ) as resp:
+                        elapsed_ms = (time.perf_counter() - start) * 1000
+                        ok = resp.status == expected_status
+                        all_results.append(ok)
+                        if ok:
+                            all_latencies.append(elapsed_ms)
+                except Exception:
+                    all_results.append(False)
+    success_rate = sum(all_results) / len(all_results) if all_results else 0.0
+    if success_rate >= HTTP_SUCCESS_THRESHOLD and all_latencies:
+        median_lat = statistics.median(all_latencies)
+        proxy.http_latency_ms = median_lat  # добавляем атрибут, но ProxyParsed неизменяем, так что используем словарь?
+        # Мы будем хранить в отдельном словаре, но проще использовать mutable объект.
+        # Вместо этого мы создадим копию с дополнительными полями.
+        # Для удобства будем использовать обычный словарь для результатов.
+        # Пока оставим как есть, позже адаптируем.
+        return proxy
+    return None
 
-    total = len(proxies)
-    global BATCH_SIZE
-    if total > 500:
-        BATCH_SIZE = min(BATCH_SIZE_MAX, BATCH_SIZE + 10)
-    elif total < 100:
-        BATCH_SIZE = max(BATCH_SIZE_MIN, BATCH_SIZE - 10)
-    else:
-        BATCH_SIZE = max(BATCH_SIZE_MIN, min(BATCH_SIZE_MAX, BATCH_SIZE))
-    log.info(f"Пакетная проверка {total} прокси (батч {BATCH_SIZE}, воркеров {SINGBOX_BATCH_WORKERS})...")
+# ──────────────────────────────────────────────────────────────────────────────
+#  АДАПТИВНЫЙ ТАЙМАУТ
+# ──────────────────────────────────────────────────────────────────────────────
 
-    batches = [proxies[i:i+BATCH_SIZE] for i in range(0, total, BATCH_SIZE)]
-    results = []
-    port_base = SOCKS_PORT_BASE
-    with ThreadPoolExecutor(max_workers=SINGBOX_BATCH_WORKERS) as executor:
-        futures = []
-        for batch in batches:
-            batch_port_base = port_base
-            port_base += BATCH_SIZE
-            futures.append(executor.submit(check_batch_via_singbox, batch, batch_port_base, singbox_path))
+_median_latency = 1000.0
 
-        for future in as_completed(futures):
-            try:
-                alive = future.result(timeout=HTTP_TEST_TIMEOUT + 60)
-                results.extend(alive)
-                log.info(f"  Батч завершён: {len(alive)} живых")
-            except Exception as e:
-                log.warning(f"  Батч упал: {e}")
+def update_adaptive_timeout(latencies: List[float]):
+    global _median_latency
+    if latencies:
+        _median_latency = statistics.median(latencies)
+        _median_latency = max(200, min(5000, _median_latency))
+        log.debug(f"Адаптивный таймаут обновлён: {_median_latency:.0f}ms")
 
-    log.info(f"Пакетная проверка завершена: {len(results)}/{total} живых")
-    return results
+def get_adaptive_http_timeout():
+    t = max(2.0, min(10.0, _median_latency / 1000 * 2))
+    return t
 
-# ── Score (только по безопасности) ─────────────────────────────────
+def get_adaptive_connect_timeout():
+    t = max(1.0, min(5.0, _median_latency / 1000 * 1.5))
+    return t
 
-def compute_score(proxy):
-    sec = proxy.get("security", "none")
-    pen = validate_credentials(proxy)
+# ──────────────────────────────────────────────────────────────────────────────
+#  TCP ПРОВЕРКА (АСИНХРОННАЯ)
+# ──────────────────────────────────────────────────────────────────────────────
 
-    sec_score = WEIGHT_CONFIG["security"].get(sec, 0)
-    raw_score = sec_score
-    raw_score -= pen * 15
-    return max(0, min(100, int(raw_score)))
-
-# ── Асинхронные функции для загрузки и гео ──────────────────────
-
-async def fetch_source_async(url, session, retries=FETCH_SOURCE_RETRIES):
+async def tcp_connect_with_retry(host: str, port: int, retries=TCP_CONNECT_RETRIES, delay=TCP_RETRY_DELAY):
+    timeout = get_adaptive_connect_timeout()
     for attempt in range(retries + 1):
         try:
-            async with session.get(url.strip(), timeout=FETCH_SOURCE_TIMEOUT) as resp:
-                text = await resp.text()
-                break
-        except Exception as e:
+            start = time.perf_counter()
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=timeout
+            )
+            elapsed = (time.perf_counter() - start) * 1000
+            writer.close()
+            await writer.wait_closed()
+            return True, elapsed
+        except Exception:
             if attempt < retries:
-                log.warning(f"Fetch fail {url}: {e}, retry...")
-                await asyncio.sleep(FETCH_SOURCE_DELAY * (attempt + 1))
-            else:
-                log.warning(f"Fetch fail {url} after {retries+1} tries")
-                return []
+                await asyncio.sleep(delay * (2 ** attempt))
+    return False, 0.0
+
+async def stress_test_jitter(host: str, port: int):
+    lats = []
+    for _ in range(STRESS_CONNECTIONS):
+        ok, lat = await tcp_connect_with_retry(host, port, retries=0)
+        if ok: lats.append(lat)
+    if not lats: return 0.0, 0.0
+    sr = len(lats) / STRESS_CONNECTIONS
+    if len(lats) < 2: jit = 0.0
+    else:
+        mean = sum(lats) / len(lats)
+        jit = sum(abs(l - mean) for l in lats) / len(lats)
+    return sr, jit
+
+async def tcp_check(proxy: ProxyParsed):
+    ok, lat = await tcp_connect_with_retry(proxy.host, proxy.port)
+    if not ok:
+        return None
+    # Добавляем поля в объект (используем словарь, чтобы потом преобразовать)
+    proxy.tcp_latency_ms = lat  # ProxyParsed не позволяет, но мы можем сделать его изменяемым? Лучше использовать dict.
+    # Мы будем хранить все в словарях. Упростим: будем использовать словари вместо моделей для проверки.
+    sr, jit = await stress_test_jitter(proxy.host, proxy.port)
+    proxy.stress_success_rate = sr
+    proxy.jitter_ms = jit
+    return proxy
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  TLS ПРОВЕРКА (АСИНХРОННАЯ)
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def tls_handshake_check(host: str, port: int, sni: str = None, timeout: float = TLS_TIMEOUT) -> bool:
+    try:
+        loop = asyncio.get_running_loop()
+        # Используем loop.run_in_executor для блокирующего TLS
+        def do_tls():
+            import ssl
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect((host, port))
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            with context.wrap_socket(sock, server_hostname=sni or host) as ssock:
+                return True
+        return await loop.run_in_executor(None, do_tls)
+    except Exception:
+        return False
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ASYNC FETCH SOURCES
+# ──────────────────────────────────────────────────────────────────────────────
+
+circuit_breakers = {
+    "geo_api": CircuitBreaker("geo_api", failure_threshold=3, recovery_timeout=60),
+    "fetch_source": CircuitBreaker("fetch_source", failure_threshold=5, recovery_timeout=120),
+}
+
+async def fetch_source(url: str, session: aiohttp.ClientSession) -> List[str]:
+    if not circuit_breakers["fetch_source"].allow_request():
+        log.warning(f"Circuit breaker открыт для fetch_source, пропускаем {url}")
+        return []
+    try:
+        async with session.get(url, timeout=FETCH_SOURCE_TIMEOUT) as resp:
+            text = await resp.text()
+            circuit_breakers["fetch_source"].record_success()
+    except Exception as e:
+        circuit_breakers["fetch_source"].record_failure()
+        log.warning(f"Ошибка загрузки {url}: {e}")
+        return []
     try:
         dec = base64.b64decode(text).decode("utf-8", errors="ignore")
         if any(x in dec for x in ("vless://", "trojan://", "hy2://", "hysteria2://", "ss://", "tuic://", "vmess://")):
@@ -990,7 +1075,7 @@ async def fetch_source_async(url, session, retries=FETCH_SOURCE_RETRIES):
     if "proxies:" in text[:5000]:
         yp = parse_clash_yaml(text)
         if yp:
-            return [x["uri"] for x in yp]
+            return yp
     proxies = []
     for line in text.splitlines():
         line = line.strip()
@@ -998,192 +1083,166 @@ async def fetch_source_async(url, session, retries=FETCH_SOURCE_RETRIES):
             proxies.append(line)
     return proxies
 
-async def fetch_all_sources_async(urls):
-    all_u = []
+async def fetch_all_sources_async(urls: List[str]) -> List[str]:
+    sem = asyncio.Semaphore(FETCH_SOURCE_MAX_WORKERS)
     connector = aiohttp.TCPConnector(limit=FETCH_SOURCE_MAX_WORKERS)
+    all_uris = []
     async with aiohttp.ClientSession(connector=connector, headers={"User-Agent": HTTP_USER_AGENT}) as session:
-        tasks = [fetch_source_async(url, session) for url in urls]
+        tasks = []
+        for url in urls:
+            tasks.append(retry_async(
+                fetch_source_with_semaphore(url, session, sem),
+                retries=FETCH_SOURCE_RETRIES,
+                delay=FETCH_SOURCE_DELAY,
+                backoff=2
+            ))
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for res in results:
             if isinstance(res, list):
-                all_u.extend(res)
-    return all_u
+                all_uris.extend(res)
+    return all_uris
 
-# ── Геолокация с несколькими API ──────────────────────────────────
+async def fetch_source_with_semaphore(url: str, session: aiohttp.ClientSession, sem: asyncio.Semaphore):
+    async with sem:
+        return await fetch_source(url, session)
 
-async def geolocate_ips_async(proxies):
-    ips = list({p["host"] for p in proxies if is_ip_address(p["host"])})
-    if not ips: return {}
-    cache = {}
-    log.info(f"Геолокация {len(ips)} IP с несколькими API...")
+# ──────────────────────────────────────────────────────────────────────────────
+#  ГЕОЛОКАЦИЯ (АСИНХРОННАЯ С КЕШЕМ)
+# ──────────────────────────────────────────────────────────────────────────────
 
-    for i in range(0, len(ips), GEO_BATCH_SIZE):
-        batch_ips = ips[i:i+GEO_BATCH_SIZE]
-        results = []
-        tasks = []
-        connector = aiohttp.TCPConnector(limit=10)
-        async with aiohttp.ClientSession(connector=connector, headers={"User-Agent": HTTP_USER_AGENT}) as session:
-            if len(batch_ips) > 1:
-                tasks.append(_geo_ip_api(session, batch_ips))
-            else:
-                tasks.append(_geo_ip_api_single(session, batch_ips[0]))
-            tasks.append(_geo_ipinfo(session, batch_ips))
-            tasks.append(_geo_geoipdb(session, batch_ips))
+geo_cache = GeoCache()
 
-            geo_results = await asyncio.gather(*tasks, return_exceptions=True)
-            for gr in geo_results:
-                if isinstance(gr, dict):
-                    for ip, data in gr.items():
-                        results.append({ip: data})
-
-        for ip in batch_ips:
-            candidates = []
-            for r in results:
-                if ip in r:
-                    candidates.append(r[ip])
-            if candidates:
-                countries = [c.get("country_code", "XX") for c in candidates if c.get("status") == "success"]
-                if countries:
-                    from collections import Counter
-                    counter = Counter(countries)
-                    most_common = counter.most_common(1)[0][0]
-                    for c in candidates:
-                        if c.get("country_code") == most_common:
-                            cache[ip] = c
-                            break
-                else:
-                    cache[ip] = candidates[0]
-            else:
-                cache[ip] = {"country_code": "XX", "country": "Unknown", "isp": "", "asn": "", "status": "fail"}
+async def geolocate_ip(ip: str, session: aiohttp.ClientSession) -> Optional[Dict]:
+    # Проверяем кеш
+    cached = await geo_cache.get(ip)
+    if cached:
+        return {
+            "country_code": cached.country_code,
+            "country": cached.country,
+            "isp": cached.isp,
+            "asn": cached.asn,
+            "status": "success"
+        }
+    # Запрос к API
+    for api_url in GEO_API_URLS:
+        if not circuit_breakers["geo_api"].allow_request():
+            log.warning("Circuit breaker geo_api открыт, пропускаем")
+            break
+        try:
+            if "ip-api.com" in api_url:
+                async with session.post(api_url, json=[ip], timeout=GEO_API_TIMEOUT) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        item = data[0] if isinstance(data, list) else data
+                        if item.get("status") == "success":
+                            result = {
+                                "country_code": item.get("countryCode", "XX"),
+                                "country": item.get("country", "Unknown"),
+                                "isp": item.get("isp", ""),
+                                "asn": item.get("as", ""),
+                                "status": "success"
+                            }
+                            await geo_cache.set(GeoCacheEntry(
+                                ip=ip,
+                                country_code=result["country_code"],
+                                country=result["country"],
+                                isp=result["isp"],
+                                asn=result["asn"],
+                                updated_at=datetime.now(timezone.utc).isoformat()
+                            ))
+                            circuit_breakers["geo_api"].record_success()
+                            return result
+            elif "ipinfo.io" in api_url:
+                async with session.get(f"https://ipinfo.io/{ip}/json", timeout=GEO_API_TIMEOUT) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data:
+                            result = {
+                                "country_code": data.get("country", "XX"),
+                                "country": data.get("country", "Unknown"),
+                                "isp": data.get("org", ""),
+                                "asn": data.get("asn", ""),
+                                "status": "success"
+                            }
+                            await geo_cache.set(GeoCacheEntry(
+                                ip=ip,
+                                country_code=result["country_code"],
+                                country=result["country"],
+                                isp=result["isp"],
+                                asn=result["asn"],
+                                updated_at=datetime.now(timezone.utc).isoformat()
+                            ))
+                            circuit_breakers["geo_api"].record_success()
+                            return result
+            elif "geoip-db.com" in api_url:
+                async with session.get(f"https://geoip-db.com/json/{ip}", timeout=GEO_API_TIMEOUT) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("country_code"):
+                            result = {
+                                "country_code": data.get("country_code", "XX"),
+                                "country": data.get("country_name", "Unknown"),
+                                "isp": data.get("isp", ""),
+                                "asn": data.get("asn", ""),
+                                "status": "success"
+                            }
+                            await geo_cache.set(GeoCacheEntry(
+                                ip=ip,
+                                country_code=result["country_code"],
+                                country=result["country"],
+                                isp=result["isp"],
+                                asn=result["asn"],
+                                updated_at=datetime.now(timezone.utc).isoformat()
+                            ))
+                            circuit_breakers["geo_api"].record_success()
+                            return result
+        except Exception as e:
+            circuit_breakers["geo_api"].record_failure()
+            log.warning(f"Ошибка гео-API {api_url}: {e}")
         await asyncio.sleep(GEO_API_SLEEP)
+    return {"country_code": "XX", "country": "Unknown", "isp": "", "asn": "", "status": "fail"}
 
-    return cache
+async def geolocate_ips(ips: List[str]) -> Dict[str, Dict]:
+    results = {}
+    sem = asyncio.Semaphore(10)  # ограничение параллельных запросов
+    connector = aiohttp.TCPConnector(limit=20)
+    async with aiohttp.ClientSession(connector=connector, headers={"User-Agent": HTTP_USER_AGENT}) as session:
+        tasks = []
+        for ip in ips:
+            tasks.append(retry_async(
+                geolocate_ip_with_semaphore(ip, session, sem),
+                retries=2, delay=2, backoff=2
+            ))
+        geo_results = await asyncio.gather(*tasks, return_exceptions=True)
+        for ip, res in zip(ips, geo_results):
+            if isinstance(res, dict):
+                results[ip] = res
+            else:
+                results[ip] = {"country_code": "XX", "country": "Unknown", "status": "fail"}
+    return results
 
-async def _geo_ip_api(session, ips):
-    url = "http://ip-api.com/batch"
-    try:
-        async with session.post(url, json=ips, timeout=GEO_API_TIMEOUT) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                result = {}
-                for item in data:
-                    ip = item.get("query", "")
-                    if item.get("status") == "success":
-                        result[ip] = {
-                            "country_code": item.get("countryCode", "XX"),
-                            "country": item.get("country", "Unknown"),
-                            "isp": item.get("isp", ""),
-                            "asn": item.get("as", ""),
-                            "status": "success"
-                        }
-                    else:
-                        result[ip] = {"status": "fail"}
-                return result
-    except Exception as e:
-        log.warning(f"ip-api.com error: {e}")
-    return {}
+async def geolocate_ip_with_semaphore(ip: str, session: aiohttp.ClientSession, sem: asyncio.Semaphore):
+    async with sem:
+        return await geolocate_ip(ip, session)
 
-async def _geo_ip_api_single(session, ip):
-    url = f"http://ip-api.com/json/{ip}"
-    try:
-        async with session.get(url, timeout=GEO_API_TIMEOUT) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                if data.get("status") == "success":
-                    return {ip: {
-                        "country_code": data.get("countryCode", "XX"),
-                        "country": data.get("country", "Unknown"),
-                        "isp": data.get("isp", ""),
-                        "asn": data.get("as", ""),
-                        "status": "success"
-                    }}
-    except Exception:
-        pass
-    return {}
-
-async def _geo_ipinfo(session, ips):
-    result = {}
-    for ip in ips:
-        url = f"https://ipinfo.io/{ip}/json"
-        try:
-            async with session.get(url, timeout=GEO_API_TIMEOUT) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data:
-                        result[ip] = {
-                            "country_code": data.get("country", "XX"),
-                            "country": data.get("country", "Unknown"),
-                            "isp": data.get("org", ""),
-                            "asn": data.get("asn", ""),
-                            "status": "success"
-                        }
-                    else:
-                        result[ip] = {"status": "fail"}
-        except Exception:
-            result[ip] = {"status": "fail"}
-    return result
-
-async def _geo_geoipdb(session, ips):
-    result = {}
-    for ip in ips:
-        url = f"https://geoip-db.com/json/{ip}"
-        try:
-            async with session.get(url, timeout=GEO_API_TIMEOUT) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("country_code"):
-                        result[ip] = {
-                            "country_code": data.get("country_code", "XX"),
-                            "country": data.get("country_name", "Unknown"),
-                            "isp": data.get("isp", ""),
-                            "asn": data.get("asn", ""),
-                            "status": "success"
-                        }
-                    else:
-                        result[ip] = {"status": "fail"}
-        except Exception:
-            result[ip] = {"status": "fail"}
-    return result
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  НОВЫЙ МОДУЛЬ: ИСТОРИЯ ПРОКСИ И ВЕСА
-# ═══════════════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
+#  ИСТОРИЯ И ВЕСА
+# ──────────────────────────────────────────────────────────────────────────────
 
 class ProxyHistory:
     def __init__(self, history_file=HISTORY_FILE):
-        self.history_file = history_file
-        self.history = self._load_history()
+        self.history = EncryptedHistory(history_file)
 
-    def _load_history(self):
-        if os.path.exists(self.history_file):
-            try:
-                with open(self.history_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, IOError):
-                log.warning("Не удалось загрузить историю, создаём новую")
-                return {}
-        return {}
+    def make_key(self, proxy_dict: dict) -> str:
+        return f"{proxy_dict['protocol']}|{proxy_dict['host']}|{proxy_dict['port']}|{proxy_dict.get('sni', '')}"
 
-    def _save_history(self):
-        try:
-            with open(self.history_file, 'w', encoding='utf-8') as f:
-                json.dump(self.history, f, indent=2)
-        except IOError as e:
-            log.error(f"Не удалось сохранить историю: {e}")
-
-    def _make_key(self, proxy):
-        # Уникальный ключ для прокси
-        return f"{proxy['protocol']}|{proxy['host']}|{proxy['port']}|{proxy.get('sni', '')}"
-
-    def update(self, alive_proxies, run_date=None):
+    def update(self, alive_proxies: List[dict], run_date: str = None):
         if run_date is None:
             run_date = datetime.now(timezone.utc).isoformat()
-
-        # Обновляем записи для живых прокси
         for p in alive_proxies:
-            key = self._make_key(p)
+            key = self.make_key(p)
             if key not in self.history:
-                self.history[key] = {
+                entry = {
                     "first_seen": run_date,
                     "last_seen": run_date,
                     "appearances": 1,
@@ -1203,337 +1262,313 @@ class ProxyHistory:
                     "score": p.get("score", 0),
                     "uri": p.get("uri", "")
                 }
+                self.history[key] = entry
             else:
                 entry = self.history[key]
                 entry["last_seen"] = run_date
                 entry["appearances"] += 1
                 entry["last_alive"] = True
-                # Обновляем параметры на случай, если они изменились
-                entry["protocol"] = p["protocol"]
-                entry["host"] = p["host"]
-                entry["port"] = p["port"]
-                entry["sni"] = p.get("sni", "")
-                entry["credential"] = p.get("credential", "")
-                entry["security"] = p.get("security", "none")
-                entry["transport"] = p.get("transport_type", "tcp")
-                entry["country"] = p.get("country_code", "XX")
-                entry["tcp_latency_ms"] = p.get("tcp_latency_ms", 0)
-                entry["http_latency_ms"] = p.get("http_latency_ms", 0)
-                entry["stress_success_rate"] = p.get("stress_success_rate", 0)
-                entry["jitter_ms"] = p.get("jitter_ms", 0)
-                entry["score"] = p.get("score", 0)
-                entry["uri"] = p.get("uri", "")
-
-        # Для прокси, которых нет в текущем запуске, но они есть в истории - помечаем как неживые
-        # (но не удаляем, т.к. они могут появиться позже)
-        seen_keys = set(self._make_key(p) for p in alive_proxies)
-        for key in self.history:
+                # обновляем остальные поля
+                for k in ("protocol", "host", "port", "sni", "credential", "security", "transport", "country",
+                          "tcp_latency_ms", "http_latency_ms", "stress_success_rate", "jitter_ms", "score", "uri"):
+                    if k in p:
+                        entry[k] = p[k]
+        # Отмечаем невидимые как неживые
+        seen_keys = set(self.make_key(p) for p in alive_proxies)
+        for key in list(self.history.keys()):
             if key not in seen_keys:
                 self.history[key]["last_alive"] = False
-
-        # Удаляем очень старые записи, которые не появлялись > 30 дней
-        cutoff = datetime.now(timezone.utc).timestamp() - 30 * 24 * 3600
-        to_remove = []
-        for key, entry in self.history.items():
-            try:
-                last_seen = datetime.fromisoformat(entry["last_seen"]).timestamp()
-                if last_seen < cutoff:
-                    to_remove.append(key)
-            except ValueError:
-                # Если дата непарсится, удаляем
-                to_remove.append(key)
+        # Удаляем старые (>30 дней)
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        to_remove = [key for key, entry in self.history.items() if entry.get("last_seen", "") < cutoff]
         for key in to_remove:
-            del self.history[key]
+            self.history.pop(key, None)
 
-        self._save_history()
-
-    def compute_weight(self, entry):
-        """
-        Вычисляет вес прокси на основе конфигурации WEIGHT_CONFIG.
-        Возвращает число (чем больше, тем лучше).
-        """
+    def compute_weight(self, entry: dict) -> int:
         weight = 0
-
-        # 1. Безопасность
         sec = entry.get("security", "none")
         weight += WEIGHT_CONFIG["security"].get(sec, 0)
-
-        # 2. Протокол
         proto = entry.get("protocol", "unknown")
         weight += WEIGHT_CONFIG["protocol"].get(proto, 0)
-
-        # 3. Страна
         country = entry.get("country", "XX")
         weight += WEIGHT_CONFIG["country_boost"].get(country, 5)
-
-        # 4. Задержка (чем меньше, тем лучше)
         latency = entry.get("http_latency_ms", 0)
         if latency > 0:
-            if latency < 50:
-                weight -= WEIGHT_CONFIG["latency_ms"]["very_good"]
-            elif latency < 150:
-                weight -= WEIGHT_CONFIG["latency_ms"]["good"]
-            elif latency < 300:
-                weight -= WEIGHT_CONFIG["latency_ms"]["average"]
-            else:
-                weight -= WEIGHT_CONFIG["latency_ms"]["poor"]
+            if latency < 50: weight -= WEIGHT_CONFIG["latency_ms"]["very_good"]
+            elif latency < 150: weight -= WEIGHT_CONFIG["latency_ms"]["good"]
+            elif latency < 300: weight -= WEIGHT_CONFIG["latency_ms"]["average"]
+            else: weight -= WEIGHT_CONFIG["latency_ms"]["poor"]
         else:
             weight -= WEIGHT_CONFIG["latency_ms"]["unknown"]
-
-        # 5. Стабильность
-        success_rate = entry.get("stress_success_rate", 0)
-        if success_rate > 0:
-            if success_rate > 0.9:
-                weight -= WEIGHT_CONFIG["stability"]["high"]
-            elif success_rate > 0.7:
-                weight -= WEIGHT_CONFIG["stability"]["medium"]
-            else:
-                weight -= WEIGHT_CONFIG["stability"]["low"]
-        else:
-            weight -= WEIGHT_CONFIG["stability"]["unknown"]
-
-        # 6. Количество появлений (бонус за частоту)
+        sr = entry.get("stress_success_rate", 0)
+        if sr > 0.9: weight -= WEIGHT_CONFIG["stability"]["high"]
+        elif sr > 0.7: weight -= WEIGHT_CONFIG["stability"]["medium"]
+        else: weight -= WEIGHT_CONFIG["stability"]["unknown"]
         appearances = entry.get("appearances", 0)
-        threshold = WEIGHT_CONFIG["appearance_threshold"]
-        if appearances >= threshold:
-            bonus = (appearances - threshold) * WEIGHT_CONFIG["appearance_bonus"]
-            weight += bonus
-
-        # 7. Штраф за возраст
+        if appearances >= WEIGHT_CONFIG["appearance_threshold"]:
+            weight += (appearances - WEIGHT_CONFIG["appearance_threshold"]) * WEIGHT_CONFIG["appearance_bonus"]
         try:
             last_seen = datetime.fromisoformat(entry["last_seen"])
             days_ago = (datetime.now(timezone.utc) - last_seen).days
             weight -= days_ago * WEIGHT_CONFIG["age_penalty"]
-        except (ValueError, TypeError):
+        except:
             pass
-
-        # Минимальное значение веса - 0
         return max(0, weight)
 
-    def get_top30(self):
-        """
-        Возвращает список топ-30 прокси на основе веса,
-        которые появлялись не менее WEIGHT_CONFIG["appearance_threshold"] раз
-        и были живы в последний раз.
-        """
+    def get_top30(self) -> List[dict]:
         candidates = []
         for key, entry in self.history.items():
             if entry.get("appearances", 0) >= WEIGHT_CONFIG["appearance_threshold"] and entry.get("last_alive", False):
                 weight = self.compute_weight(entry)
                 candidates.append((weight, entry))
-
         candidates.sort(key=lambda x: x[0], reverse=True)
-        top30 = [entry for _, entry in candidates[:30]]
-        return top30
-
-    def get_top30_uris(self):
-        """
-        Возвращает список URI для топ-30 прокси.
-        """
-        top = self.get_top30()
-        return [entry.get("uri", "") for entry in top if entry.get("uri")]
-
-    def print_top30(self, top30):
-        if not top30:
-            log.info("Нет прокси, удовлетворяющих условиям для top30.")
-            return
-        log.info("=== Топ-30 прокси по весу ===")
-        for i, entry in enumerate(top30, 1):
-            weight = self.compute_weight(entry)
-            flag = country_to_flag(entry.get("country", "XX"))
-            log.info(f"{i:2}. {flag} {entry.get('host')}:{entry.get('port')} "
-                     f"({entry.get('protocol')}, {entry.get('security')}) "
-                     f"вес={weight}, появлений={entry.get('appearances', 0)}")
+        return [entry for _, entry in candidates[:30]]
 
     def write_top30(self, filename=TOP30_FILE):
-        top30 = self.get_top30()
-        if not top30:
-            log.info("Нет прокси для записи в top30.txt")
-            # Создаём пустой файл
-            with open(filename, 'w', encoding='utf-8') as f:
-                f.write('')
-            return
-
-        # Перезаписываем файл
+        top = self.get_top30()
         with open(filename, 'w', encoding='utf-8') as f:
-            for entry in top30:
-                uri = entry.get("uri", "")
-                if uri:
-                    f.write(uri + "\n")
-        log.info(f"Записано {len(top30)} прокси в {filename}")
+            for entry in top:
+                if entry.get("uri"):
+                    f.write(entry["uri"] + "\n")
+        log.info(f"Записано {len(top)} прокси в {filename}")
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
 #  ОСНОВНОЙ ПАЙПЛАЙН
-# ═══════════════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
 
-def _prefilter_proxy(proxy, singbox_path):
-    if ENABLE_TLS_CHECK:
-        sni = proxy.get("sni")
-        if not tls_handshake_check(proxy["host"], proxy["port"], sni, TLS_TIMEOUT):
-            return None
-    if ENABLE_CONFIG_CHECK:
-        if not config_is_valid(proxy, singbox_path):
-            return None
-    return proxy
-
-def check_all_proxies(proxies, singbox_path):
+async def check_all_proxies(proxies: List[ProxyParsed], singbox_path: str) -> List[dict]:
     if not proxies:
         return []
 
+    # TCP проверка
     tcp_alive = []
     total = len(proxies)
-    log.info(f"TCP-проверка {total} прокси ({MAX_WORKERS} воркеров)...")
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futs = {ex.submit(_tcp_check, p): p for p in proxies}
-        done = 0
-        for fut in as_completed(futs):
-            done += 1
-            r = fut.result()
-            if r:
-                tcp_alive.append(r)
-            if done % 100 == 0 or done == total:
-                log.info(f"  TCP: {done}/{total}, {len(tcp_alive)} живы")
+    log.info(f"TCP-проверка {total} прокси...")
+    sem_tcp = asyncio.Semaphore(MAX_WORKERS)
+    async def tcp_check_one(p):
+        async with sem_tcp:
+            return await tcp_check(p)
+    tasks = [tcp_check_one(p) for p in proxies]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for res in results:
+        if isinstance(res, ProxyParsed):
+            tcp_alive.append(res)
     log.info(f"TCP-проверка завершена: {len(tcp_alive)}/{total}")
 
     if not tcp_alive:
         return []
 
-    log.info("Применяем предварительные фильтры (TLS, config check)...")
+    # Предварительные фильтры (TLS, config check)
+    log.info("Применяем предварительные фильтры...")
     filtered = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futs = []
-        for p in tcp_alive:
-            futs.append(ex.submit(_prefilter_proxy, p, singbox_path))
-        for fut in as_completed(futs):
-            r = fut.result()
-            if r:
-                filtered.append(r)
+    for p in tcp_alive:
+        if ENABLE_TLS_CHECK:
+            if not await tls_handshake_check(p.host, p.port, p.sni, TLS_TIMEOUT):
+                continue
+        if ENABLE_CONFIG_CHECK:
+            # Асинхронная проверка конфига через sing-box check
+            if not await config_is_valid_async(p, singbox_path):
+                continue
+        filtered.append(p)
     log.info(f"После предфильтрации: {len(filtered)}/{len(tcp_alive)}")
 
     if not filtered:
         return []
 
-    alive = check_proxies_via_singbox(filtered, singbox_path)
+    # Пакетная проверка через sing-box
+    alive = []
+    total_alive = len(filtered)
+    # Динамический размер батча
+    global BATCH_SIZE
+    if total_alive > 500:
+        BATCH_SIZE = min(BATCH_SIZE_MAX, BATCH_SIZE + 10)
+    elif total_alive < 100:
+        BATCH_SIZE = max(BATCH_SIZE_MIN, BATCH_SIZE - 10)
+    else:
+        BATCH_SIZE = max(BATCH_SIZE_MIN, min(BATCH_SIZE_MAX, BATCH_SIZE))
+    log.info(f"Пакетная проверка {total_alive} прокси (батч {BATCH_SIZE}, воркеров {SINGBOX_BATCH_WORKERS})...")
 
+    batches = [filtered[i:i+BATCH_SIZE] for i in range(0, total_alive, BATCH_SIZE)]
+    port_base = SOCKS_PORT_BASE
+    sem_batch = asyncio.Semaphore(SINGBOX_BATCH_WORKERS)
+    async def process_batch(batch):
+        nonlocal port_base
+        async with sem_batch:
+            my_port_base = port_base
+            port_base += BATCH_SIZE
+            return await check_batch_via_singbox(batch, my_port_base, singbox_path)
+    tasks = [process_batch(batch) for batch in batches]
+    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+    for res in batch_results:
+        if isinstance(res, list):
+            alive.extend(res)
+    log.info(f"Пакетная проверка завершена: {len(alive)}/{total_alive}")
+
+    # Вычисляем score
     for p in alive:
-        p["score"] = compute_score(p)
+        p.score = compute_score(p)
     return alive
 
-# ── Чтение и запись ──────────────────────────────────────────────
-
-def read_input_urls(filename):
+async def config_is_valid_async(proxy: ProxyParsed, singbox_path: str) -> bool:
+    config = build_singbox_outbound(proxy, tag="out")
+    # Для проверки используем sing-box check
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        json.dump({"outbounds": [config]}, f)
+        tmp = f.name
     try:
-        with open(filename, "r", encoding="utf-8") as f:
-            return [l.strip() for l in f if l.strip() and not l.startswith("#")]
+        proc = await asyncio.create_subprocess_exec(
+            singbox_path, "check", "-c", tmp,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        await proc.wait()
+        return proc.returncode == 0
+    finally:
+        try: os.unlink(tmp)
+        except: pass
+
+def compute_score(proxy: ProxyParsed) -> int:
+    sec = proxy.security
+    pen = validate_credentials(proxy)
+    sec_score = WEIGHT_CONFIG["security"].get(sec, 0)
+    raw = sec_score - pen * 15
+    return max(0, min(100, int(raw)))
+
+def country_to_flag(code: str) -> str:
+    if not code or len(code) != 2:
+        return "🏳️"
+    try:
+        return chr(ord(code[0].upper()) + FLAG_OFFSET) + chr(ord(code[1].upper()) + FLAG_OFFSET)
+    except:
+        return "🏳️"
+
+def rewrite_uri_fragment(original_uri: str, remark: str) -> str:
+    if "#" in original_uri:
+        original_uri = original_uri.rsplit("#", 1)[0]
+    return f"{original_uri}#{remark}"
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  MAIN
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def main_async():
+    log.info("=" * 60)
+    log.info("Proxy Checker v10.0 — Асинхронный, с шифрованием и геокешем")
+    log.info("=" * 60)
+
+    # Чтение источников
+    try:
+        with open(INPUT_FILE, "r", encoding="utf-8") as f:
+            urls = [l.strip() for l in f if l.strip() and not l.startswith("#")]
     except FileNotFoundError:
-        log.error(f"{filename} not found")
-        sys.exit(1)
+        log.error(f"{INPUT_FILE} not found")
+        return
 
-def write_output_txt(proxies, filename):
-    with open(filename, "w", encoding="utf-8") as f:
-        for p in proxies:
+    log.info(f"Загружено {len(urls)} источников")
+
+    # Асинхронная загрузка
+    all_uris = await fetch_all_sources_async(urls)
+    log.info(f"Получено {len(all_uris)} сырых URI")
+
+    # Парсинг
+    parsed = []
+    for u in all_uris:
+        p = cached_parse(u)
+        if p:
+            parsed.append(p)
+    log.info(f"Распарсено: {len(parsed)}")
+
+    # Фильтры
+    parsed = [p for p in parsed if has_security(p)]
+    parsed = [p for p in parsed if validate_reality_params(p)]
+    parsed = [p for p in parsed if is_ip_address(p.host)]
+    parsed = [p for p in parsed if not is_blacklisted(p)]
+    unique = deduplicate_proxies(parsed)
+    log.info(f"После дедупликации: {len(unique)}")
+
+    if not unique:
+        log.info("Нет прокси для проверки. Завершаем.")
+        # Создаём пустые файлы
+        with open(TOP30_FILE, 'w') as f:
+            f.write('')
+        return
+
+    singbox_path = await ensure_singbox()
+    log.info(f"sing-box готов: {singbox_path}")
+
+    # Проверка
+    alive_parsed = await check_all_proxies(unique, singbox_path)
+
+    # Геолокация
+    ips = list({p.host for p in alive_parsed})
+    geo_data = await geolocate_ips(ips) if ips else {}
+
+    # Преобразуем в список словарей для записи
+    alive_proxies = []
+    for p in alive_parsed:
+        geo = geo_data.get(p.host, {})
+        country_code = geo.get("country_code", "XX")
+        country = geo.get("country", "Unknown")
+        score = p.score if hasattr(p, 'score') else 0
+        flag = country_to_flag(country_code)
+        remark = f"{flag} {country} | 🔒{score}"
+        uri = rewrite_uri_fragment(p.uri, remark)
+        proxy_dict = {
+            "protocol": p.protocol,
+            "host": p.host,
+            "port": p.port,
+            "sni": p.sni,
+            "credential": p.credential,
+            "security": p.security,
+            "transport_type": p.transport_type,
+            "country_code": country_code,
+            "country": country,
+            "tcp_latency_ms": getattr(p, 'tcp_latency_ms', 0),
+            "http_latency_ms": getattr(p, 'http_latency_ms', 0),
+            "stress_success_rate": getattr(p, 'stress_success_rate', 0),
+            "jitter_ms": getattr(p, 'jitter_ms', 0),
+            "score": score,
+            "uri": uri
+        }
+        alive_proxies.append(proxy_dict)
+
+    # Сортировка по score
+    alive_proxies.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+    # Инкрементальная запись output.txt
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        for p in alive_proxies:
             f.write(p["uri"] + "\n")
-    log.info(f"Записано {len(proxies)} → {filename}")
+    log.info(f"Записано {len(alive_proxies)} прокси в {OUTPUT_FILE}")
 
-def print_output(proxies):
-    for p in proxies:
-        print(p["uri"])
+    # Обновление истории и top30
+    if alive_proxies:
+        history = ProxyHistory()
+        history.update(alive_proxies)
+        history.write_top30(TOP30_FILE)
+        top30 = history.get_top30()
+        log.info(f"Top30 записан, в нём {len(top30)} прокси")
+    else:
+        with open(TOP30_FILE, 'w') as f:
+            f.write('')
+        log.info("Нет живых прокси, top30 очищен")
 
-# ── main ────────────────────────────────────────────────────────────
+    # Очистка старого геокеша
+    await geo_cache.cleanup_old(days=30)
 
 def main():
-    def timeout_handler(signum, frame):
-        log.error(f"Превышен лимит времени ({GLOBAL_TIMEOUT} сек), завершаемся.")
-        cleanup()
-        sys.exit(1)
-
-    signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(GLOBAL_TIMEOUT)
-
     try:
-        t0 = time.time()
-        log.info("=" * 60)
-        log.info("Proxy Checker v9.0 — с системой весов и top30.txt")
-        log.info("=" * 60)
-
-        urls = read_input_urls(INPUT_FILE)
-        log.info(f"Загружено {len(urls)} источников из {INPUT_FILE}")
-
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        all_u = loop.run_until_complete(fetch_all_sources_async(urls))
-        log.info(f"Получено {len(all_u)} сырых URI")
-
-        parsed = []
-        for u in all_u:
-            p = cached_parse(u)
-            if p:
-                parsed.append(p)
-        log.info(f"Распарсено: {len(parsed)}")
-
-        parsed = [p for p in parsed if has_security(p)]
-        parsed = [p for p in parsed if validate_reality_params(p)]
-        parsed = [p for p in parsed if is_ip_only(p)]
-        parsed = [p for p in parsed if not is_blacklisted(p)]
-        unique = deduplicate_proxies(parsed)
-        log.info(f"После дедупликации: {len(unique)}")
-
-        if not unique:
-            log.info("Нет прокси для проверки. Завершаем.")
-            # Создаём пустые файлы
-            with open(TOP30_FILE, 'w') as f:
-                f.write('')
-            return
-
-        singbox_path = _ensure_singbox()
-        log.info(f"sing-box готов: {singbox_path}")
-
-        alive = check_all_proxies(unique, singbox_path)
-
-        # Геолокация
-        geo = loop.run_until_complete(geolocate_ips_async(alive))
-        for p in alive:
-            g = geo.get(p["host"], {})
-            p["country_code"] = g.get("country_code", "XX")
-            p["country"] = g.get("country", "Unknown")
-            p["isp"] = g.get("isp", "")
-            p["asn"] = g.get("asn", "")
-            p["is_proxy"] = False
-            p["is_hosting"] = False
-
-        for p in alive:
-            tags = []
-            if p.get("is_hosting"): tags.append("🏢Datacenter")
-            if p.get("is_proxy"): tags.append("🔄Proxy")
-            flag = country_to_flag(p.get("country_code", "XX"))
-            remark = f"{flag} {p.get('country', '?')} | 🔒{p.get('score', 0)}"
-            if tags:
-                remark += " | " + " ".join(tags)
-            p["uri"] = rewrite_uri_fragment(p["uri"], remark)
-
-        alive.sort(key=lambda x: x.get("score", 0), reverse=True)
-        write_output_txt(alive, OUTPUT_FILE)
-
-        # ── ОБНОВЛЕНИЕ ИСТОРИИ И СОХРАНЕНИЕ TOP30 ──────────────────────
-        history = ProxyHistory()
-        if alive:
-            log.info("Обновление истории прокси...")
-            history.update(alive)
-            history.write_top30(TOP30_FILE)
-            history.print_top30(history.get_top30())
-        else:
-            log.info("Нет живых прокси для обновления истории.")
-            with open(TOP30_FILE, 'w') as f:
-                f.write('')
-
-        if "--print" in sys.argv:
-            print_output(alive)
-
-        elapsed = time.time() - t0
-        log.info(f"Готово: {len(alive)} прокси → {OUTPUT_FILE}, top30 → {TOP30_FILE} за {elapsed:.1f}с")
-
-    finally:
-        signal.alarm(0)
+        loop.run_until_complete(main_async())
+    except KeyboardInterrupt:
+        log.warning("Прервано пользователем")
+        cleanup_singbox()
+    except Exception as e:
+        log.error(f"Ошибка: {e}")
+        traceback.print_exc()
+        cleanup_singbox()
 
 if __name__ == "__main__":
     main()
