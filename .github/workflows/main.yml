@@ -30,13 +30,7 @@ jobs:
       - name: Commit updated files
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          # добавляем все файлы, которые могут измениться
-          git add output.txt top30.txt history.json
-
-          # если есть изменения – коммитим
+          git config user.email "github-actions[bot]@users.github.com"
+          git add output.txt top30.txt history.json secret.key geo_cache.db
           git diff --staged --quiet || git commit -m "Update proxy lists and history [skip ci]"
-
-          # пушим обратно в репозиторий
           git push
