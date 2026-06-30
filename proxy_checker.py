@@ -4,6 +4,7 @@ Multi-Protocol Proxy Checker — Production Edition v10.1
 =======================================================
 Исправлена ошибка вызова check_batch_via_singbox.
 Теперь используется check_proxies_via_singbox с правильной сигнатурой.
+Добавлена отладка: логирование stderr sing-box, проверка бинарника, сохранение конфига.
 """
 
 import re
@@ -123,6 +124,10 @@ HTTP_USER_AGENT = "ProxyChecker/10.1 (GitHub Actions)"
 LOG_LEVEL = logging.INFO
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# ---- Отладка ----
+DEBUG = True                     # Включаем подробные логи
+DEBUG_SAVE_CONFIG = True        # Сохранять конфиг sing-box в /tmp для ручной проверки
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  ЛОГГЕР И ОБРАБОТЧИКИ СИГНАЛОВ
@@ -533,6 +538,8 @@ def stress_test_jitter(host, port):
 def _tcp_check(proxy):
     h, p = proxy["host"], proxy["port"]
     ok, lat = tcp_connect_with_retry(h, p)
+    if DEBUG:
+        log.debug(f"TCP check {h}:{p} -> {'OK' if ok else 'FAIL'} ({lat:.1f}ms)")
     if not ok:
         return None
     proxy["tcp_latency_ms"] = lat
@@ -624,6 +631,7 @@ def config_is_valid(proxy: dict, singbox_path: str) -> bool:
 def _ensure_singbox() -> str:
     global _singbox_downloaded
     if os.path.exists(SINGBOX_CACHE_PATH) and os.access(SINGBOX_CACHE_PATH, os.X_OK):
+        log.info(f"sing-box binary: {SINGBOX_CACHE_PATH} (exists, executable)")
         return SINGBOX_CACHE_PATH
 
     with _singbox_download_lock:
@@ -1116,11 +1124,14 @@ def check_batch_via_singbox(batch: list[dict], base_port: int, singbox_path: str
         fd, tmpfile = tempfile.mkstemp(suffix=".json", prefix="singbox-batch-")
         with os.fdopen(fd, "w") as f:
             json.dump(config, f)
+        if DEBUG_SAVE_CONFIG:
+            log.info(f"Сохранён конфиг батча: {tmpfile} (можно проверить вручную)")
     except Exception as e:
         log.warning(f"Не удалось записать конфиг батча: {e}")
         return []
 
     proc = None
+    stderr_output = ""
     try:
         proc = subprocess.Popen([singbox_path, "run", "-c", tmpfile],
                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
@@ -1131,6 +1142,12 @@ def check_batch_via_singbox(batch: list[dict], base_port: int, singbox_path: str
         start_time = time.time()
         while time.time() - start_time < SINGBOX_STARTUP_WAIT:
             if proc.poll() is not None:
+                # Процесс упал — собираем stderr
+                stderr_output = proc.stderr.read() if proc.stderr else ""
+                if stderr_output:
+                    log.error(f"sing-box упал при старте. stderr: {stderr_output[:500]}")
+                else:
+                    log.error("sing-box упал без сообщений в stderr")
                 return []
             for port in ports:
                 if port in ready_ports:
@@ -1140,13 +1157,22 @@ def check_batch_via_singbox(batch: list[dict], base_port: int, singbox_path: str
                     s.settimeout(0.3)
                     if s.connect_ex(("127.0.0.1", port)) == 0:
                         ready_ports.add(port)
+                        if DEBUG:
+                            log.debug(f"Порт {port} готов")
                     s.close()
                 except:
                     pass
             if len(ready_ports) == len(ports):
+                if DEBUG:
+                    log.debug(f"Все {len(ports)} портов готовы")
                 break
             time.sleep(0.1)
         else:
+            log.warning(f"Таймаут ожидания портов. Готово {len(ready_ports)}/{len(ports)}")
+            # Логируем, какие порты не готовы
+            missing = [p for p in ports if p not in ready_ports]
+            for p in missing[:5]:  # не засоряем лог
+                log.warning(f"Порт {p} не открылся")
             return []
 
         loop = asyncio.new_event_loop()
@@ -1170,6 +1196,10 @@ def check_batch_via_singbox(batch: list[dict], base_port: int, singbox_path: str
 
     except Exception as e:
         log.warning(f"Ошибка в пакетной проверке: {e}")
+        if proc and proc.poll() is None:
+            stderr_output = proc.stderr.read() if proc.stderr else ""
+            if stderr_output:
+                log.error(f"stderr sing-box: {stderr_output[:500]}")
         return []
     finally:
         if proc is not None:
@@ -1184,10 +1214,13 @@ def check_batch_via_singbox(batch: list[dict], base_port: int, singbox_path: str
             if proc in singbox_processes:
                 singbox_processes.remove(proc)
         if tmpfile and os.path.exists(tmpfile):
-            try:
-                os.unlink(tmpfile)
-            except:
-                pass
+            if DEBUG_SAVE_CONFIG:
+                log.info(f"Конфиг сохранён: {tmpfile} (не удалён для отладки)")
+            else:
+                try:
+                    os.unlink(tmpfile)
+                except:
+                    pass
 
 def check_proxies_via_singbox(proxies: list[dict], singbox_path: str) -> list[dict]:
     if not proxies:
@@ -1609,7 +1642,7 @@ def main():
     try:
         t0 = time.time()
         log.info("=" * 60)
-        log.info("Proxy Checker v10.1 — Исправленная версия")
+        log.info("Proxy Checker v10.1 — Исправленная версия (отладка включена)")
         log.info("=" * 60)
 
         urls = read_input_urls(INPUT_FILE)
@@ -1637,7 +1670,7 @@ def main():
             return
 
         singbox_path = _ensure_singbox()
-        log.info(f"sing-box готов: {singbox_path}")
+        log.info(f"sing-box путь: {singbox_path}")
 
         alive = check_all_proxies(unique, singbox_path)
 
