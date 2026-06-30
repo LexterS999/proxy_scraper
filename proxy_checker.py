@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Multi-Protocol Proxy Checker — Production Edition v9.0
+Multi-Protocol Proxy Checker — Production Edition v9.1
 =======================================================
 Изменения:
-  - Убрана проверка скорости и сохранение fast_output.txt.
-  - Добавлена система весов и сохранение top30.txt на основе повторяемости.
-  - Внедрено сохранение истории прокси между запусками.
+  - Удалён top30.txt, вместо этого часто появляющиеся прокси (>=4 раз) получают бонус +20 к score.
+  - Расширена поддержка транспортов: tcp, ws, http, xhttp, grpc, quic.
+  - В output.txt сохраняются только secure-профили.
 """
 
 import re
@@ -45,7 +45,6 @@ import yaml
 
 INPUT_FILE = "input.txt"
 OUTPUT_FILE = "output.txt"
-TOP30_FILE = "top30.txt"
 HISTORY_FILE = "history.json"
 CONFIG_FILE = "config.yaml"
 
@@ -70,7 +69,7 @@ STRESS_CONNECTIONS = 1
 SINGBOX_VERSION = "1.12.19"
 SINGBOX_CACHE_PATH = "/tmp/sing-box/sing-box"
 SINGBOX_DOWNLOAD_URL = f"https://github.com/SagerNet/sing-box/releases/download/v{SINGBOX_VERSION}/sing-box-{SINGBOX_VERSION}-linux-amd64.tar.gz"
-SUPPORTED_SINGBOX_TRANSPORTS = {"tcp", "ws", "http", "quic", "grpc"}
+SUPPORTED_SINGBOX_TRANSPORTS = {"tcp", "ws", "http", "quic", "grpc", "xhttp"}
 SOCKS_PORT_BASE = 20800
 
 # ---- Размер батча (динамический) ----
@@ -102,7 +101,7 @@ HTTP_SUCCESS_THRESHOLD = 0.5
 # ---- Предфильтрация ----
 ENABLE_CONFIG_CHECK = True
 
-# ---- Веса для ранжирования ----
+# ---- Веса для ранжирования (используются только для score) ----
 WEIGHT_CONFIG = {
     "security": {
         "reality": 100,
@@ -125,8 +124,7 @@ WEIGHT_CONFIG = {
         "SG": 10,
         "JP": 9,
         "CA": 7,
-        "RU": 5,  # может быть полезно для обхода
-        # по умолчанию 5
+        "RU": 5,
     },
     "latency_ms": {
         "very_good": 0,      # < 50ms
@@ -141,16 +139,17 @@ WEIGHT_CONFIG = {
         "low": 15,           # < 0.7
         "unknown": 10
     },
-    "appearance_bonus": 5,   # за каждое появление сверх порога
-    "appearance_threshold": 3,  # сколько раз должен появиться, чтобы попасть в топ
-    "age_penalty": 1,        # за каждый день с последнего появления
 }
+
+# Бонус за частоту появлений (добавляется после обновления истории)
+APPEARANCE_BONUS_THRESHOLD = 4   # минимальное число появлений для бонуса
+APPEARANCE_BONUS_VALUE = 20      # добавляется к score
 
 # ---- Прочие ----
 FETCH_SOURCE_RETRIES = 2
 FETCH_SOURCE_DELAY = 10.0
 TCP_CONNECT_RETRIES = 1
-HTTP_USER_AGENT = "ProxyChecker/9.0 (GitHub Actions)"
+HTTP_USER_AGENT = "ProxyChecker/9.1 (GitHub Actions)"
 LOG_LEVEL = logging.INFO
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -751,25 +750,44 @@ def _build_singbox_outbound(proxy: dict, tag: str) -> dict:
             outbound["tls"] = {"enabled": True, "server_name": sni or ""}
         else:
             outbound["tls"] = {"enabled": False}
+
+        # Расширенная обработка транспортов
         if transport != "tcp":
             outbound["transport"] = {"type": transport}
-            if transport == "ws":
-                p = params.get("path") or ["/"]
-                if isinstance(p, list): p = p[0]
-                outbound["transport"]["path"] = p
-                hdr = params.get("host") or [None]
-                if isinstance(hdr, list): hdr = hdr[0]
-                if hdr and isinstance(hdr, str):
-                    outbound["transport"]["headers"] = {"Host": hdr}
+            if transport in ["ws", "http", "xhttp"]:
+                path = params.get("path") or [""]
+                if isinstance(path, list): path = path[0]
+                if path:
+                    outbound["transport"]["path"] = path
+                host_hdr = params.get("host") or [None]
+                if isinstance(host_hdr, list): host_hdr = host_hdr[0]
+                if host_hdr:
+                    outbound["transport"]["headers"] = {"Host": host_hdr}
             elif transport == "grpc":
                 svc = params.get("serviceName") or [""]
                 if isinstance(svc, list): svc = svc[0]
                 outbound["transport"]["service_name"] = svc
+            # quic не требует дополнительных параметров
+
     elif proto == "trojan":
         outbound["password"] = cred
         outbound["tls"] = {"enabled": True, "server_name": sni or ""}
         if transport != "tcp":
             outbound["transport"] = {"type": transport}
+            if transport in ["ws", "http", "xhttp"]:
+                path = params.get("path") or [""]
+                if isinstance(path, list): path = path[0]
+                if path:
+                    outbound["transport"]["path"] = path
+                host_hdr = params.get("host") or [None]
+                if isinstance(host_hdr, list): host_hdr = host_hdr[0]
+                if host_hdr:
+                    outbound["transport"]["headers"] = {"Host": host_hdr}
+            elif transport == "grpc":
+                svc = params.get("serviceName") or [""]
+                if isinstance(svc, list): svc = svc[0]
+                outbound["transport"]["service_name"] = svc
+
     elif proto == "hy2":
         outbound["password"] = cred
         outbound["tls"] = {"enabled": True, "server_name": sni or ""}
@@ -779,6 +797,7 @@ def _build_singbox_outbound(proxy: dict, tag: str) -> dict:
             obfs_pw = params.get("obfs-password") or [""]
             if isinstance(obfs_pw, list): obfs_pw = obfs_pw[0]
             outbound["obfs"] = {"type": obfs, "password": obfs_pw}
+
     elif proto == "tuic":
         u, pw = cred.split(":", 1)
         outbound["uuid"] = u
@@ -788,6 +807,7 @@ def _build_singbox_outbound(proxy: dict, tag: str) -> dict:
         if isinstance(cc, list): cc = cc[0]
         if cc:
             outbound["congestion_control"] = cc
+
     elif proto == "ss":
         method, pw = cred.split(":", 1)
         outbound["method"] = method
@@ -955,7 +975,7 @@ def check_proxies_via_singbox(proxies: list[dict], singbox_path: str) -> list[di
     log.info(f"Пакетная проверка завершена: {len(results)}/{total} живых")
     return results
 
-# ── Score (только по безопасности) ─────────────────────────────────
+# ── Score (базовый, без бонуса за частоту) ──────────────────────
 
 def compute_score(proxy):
     sec = proxy.get("security", "none")
@@ -1146,7 +1166,7 @@ async def _geo_geoipdb(session, ips):
     return result
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  НОВЫЙ МОДУЛЬ: ИСТОРИЯ ПРОКСИ И ВЕСА
+#  МОДУЛЬ ИСТОРИИ (без top30)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class ProxyHistory:
@@ -1172,14 +1192,12 @@ class ProxyHistory:
             log.error(f"Не удалось сохранить историю: {e}")
 
     def _make_key(self, proxy):
-        # Уникальный ключ для прокси
         return f"{proxy['protocol']}|{proxy['host']}|{proxy['port']}|{proxy.get('sni', '')}"
 
     def update(self, alive_proxies, run_date=None):
         if run_date is None:
             run_date = datetime.now(timezone.utc).isoformat()
 
-        # Обновляем записи для живых прокси
         for p in alive_proxies:
             key = self._make_key(p)
             if key not in self.history:
@@ -1208,7 +1226,7 @@ class ProxyHistory:
                 entry["last_seen"] = run_date
                 entry["appearances"] += 1
                 entry["last_alive"] = True
-                # Обновляем параметры на случай, если они изменились
+                # обновляем параметры
                 entry["protocol"] = p["protocol"]
                 entry["host"] = p["host"]
                 entry["port"] = p["port"]
@@ -1224,14 +1242,13 @@ class ProxyHistory:
                 entry["score"] = p.get("score", 0)
                 entry["uri"] = p.get("uri", "")
 
-        # Для прокси, которых нет в текущем запуске, но они есть в истории - помечаем как неживые
-        # (но не удаляем, т.к. они могут появиться позже)
+        # Помечаем неживые
         seen_keys = set(self._make_key(p) for p in alive_proxies)
         for key in self.history:
             if key not in seen_keys:
                 self.history[key]["last_alive"] = False
 
-        # Удаляем очень старые записи, которые не появлялись > 30 дней
+        # Удаляем старые (>30 дней)
         cutoff = datetime.now(timezone.utc).timestamp() - 30 * 24 * 3600
         to_remove = []
         for key, entry in self.history.items():
@@ -1240,127 +1257,16 @@ class ProxyHistory:
                 if last_seen < cutoff:
                     to_remove.append(key)
             except ValueError:
-                # Если дата непарсится, удаляем
                 to_remove.append(key)
         for key in to_remove:
             del self.history[key]
 
         self._save_history()
 
-    def compute_weight(self, entry):
-        """
-        Вычисляет вес прокси на основе конфигурации WEIGHT_CONFIG.
-        Возвращает число (чем больше, тем лучше).
-        """
-        weight = 0
-
-        # 1. Безопасность
-        sec = entry.get("security", "none")
-        weight += WEIGHT_CONFIG["security"].get(sec, 0)
-
-        # 2. Протокол
-        proto = entry.get("protocol", "unknown")
-        weight += WEIGHT_CONFIG["protocol"].get(proto, 0)
-
-        # 3. Страна
-        country = entry.get("country", "XX")
-        weight += WEIGHT_CONFIG["country_boost"].get(country, 5)
-
-        # 4. Задержка (чем меньше, тем лучше)
-        latency = entry.get("http_latency_ms", 0)
-        if latency > 0:
-            if latency < 50:
-                weight -= WEIGHT_CONFIG["latency_ms"]["very_good"]
-            elif latency < 150:
-                weight -= WEIGHT_CONFIG["latency_ms"]["good"]
-            elif latency < 300:
-                weight -= WEIGHT_CONFIG["latency_ms"]["average"]
-            else:
-                weight -= WEIGHT_CONFIG["latency_ms"]["poor"]
-        else:
-            weight -= WEIGHT_CONFIG["latency_ms"]["unknown"]
-
-        # 5. Стабильность
-        success_rate = entry.get("stress_success_rate", 0)
-        if success_rate > 0:
-            if success_rate > 0.9:
-                weight -= WEIGHT_CONFIG["stability"]["high"]
-            elif success_rate > 0.7:
-                weight -= WEIGHT_CONFIG["stability"]["medium"]
-            else:
-                weight -= WEIGHT_CONFIG["stability"]["low"]
-        else:
-            weight -= WEIGHT_CONFIG["stability"]["unknown"]
-
-        # 6. Количество появлений (бонус за частоту)
-        appearances = entry.get("appearances", 0)
-        threshold = WEIGHT_CONFIG["appearance_threshold"]
-        if appearances >= threshold:
-            bonus = (appearances - threshold) * WEIGHT_CONFIG["appearance_bonus"]
-            weight += bonus
-
-        # 7. Штраф за возраст
-        try:
-            last_seen = datetime.fromisoformat(entry["last_seen"])
-            days_ago = (datetime.now(timezone.utc) - last_seen).days
-            weight -= days_ago * WEIGHT_CONFIG["age_penalty"]
-        except (ValueError, TypeError):
-            pass
-
-        # Минимальное значение веса - 0
-        return max(0, weight)
-
-    def get_top30(self):
-        """
-        Возвращает список топ-30 прокси на основе веса,
-        которые появлялись не менее WEIGHT_CONFIG["appearance_threshold"] раз
-        и были живы в последний раз.
-        """
-        candidates = []
-        for key, entry in self.history.items():
-            if entry.get("appearances", 0) >= WEIGHT_CONFIG["appearance_threshold"] and entry.get("last_alive", False):
-                weight = self.compute_weight(entry)
-                candidates.append((weight, entry))
-
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        top30 = [entry for _, entry in candidates[:30]]
-        return top30
-
-    def get_top30_uris(self):
-        """
-        Возвращает список URI для топ-30 прокси.
-        """
-        top = self.get_top30()
-        return [entry.get("uri", "") for entry in top if entry.get("uri")]
-
-    def print_top30(self, top30):
-        if not top30:
-            log.info("Нет прокси, удовлетворяющих условиям для top30.")
-            return
-        log.info("=== Топ-30 прокси по весу ===")
-        for i, entry in enumerate(top30, 1):
-            weight = self.compute_weight(entry)
-            flag = country_to_flag(entry.get("country", "XX"))
-            log.info(f"{i:2}. {flag} {entry.get('host')}:{entry.get('port')} "
-                     f"({entry.get('protocol')}, {entry.get('security')}) "
-                     f"вес={weight}, появлений={entry.get('appearances', 0)}")
-
-    def write_top30(self, filename=TOP30_FILE):
-        top30 = self.get_top30()
-        if not top30:
-            log.info("Нет прокси для записи в top30.txt")
-            # Создаём пустой файл
-            with open(filename, 'w', encoding='utf-8') as f:
-                f.write('')
-            return
-
-        # Перезаписываем файл
-        with open(filename, 'w', encoding='utf-8') as f:
-            for entry in top30:
-                uri = entry.get("uri", "")
-                if uri:
-                    f.write(uri + "\n")
-        log.info(f"Записано {len(top30)} прокси в {filename}")
+    def get_appearances(self, proxy):
+        key = self._make_key(proxy)
+        entry = self.history.get(key)
+        return entry.get("appearances", 0) if entry else 0
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  ОСНОВНОЙ ПАЙПЛАЙН
@@ -1453,7 +1359,7 @@ def main():
     try:
         t0 = time.time()
         log.info("=" * 60)
-        log.info("Proxy Checker v9.0 — с системой весов и top30.txt")
+        log.info("Proxy Checker v9.1 — с бонусом за частоту появлений")
         log.info("=" * 60)
 
         urls = read_input_urls(INPUT_FILE)
@@ -1480,8 +1386,8 @@ def main():
 
         if not unique:
             log.info("Нет прокси для проверки. Завершаем.")
-            # Создаём пустые файлы
-            with open(TOP30_FILE, 'w') as f:
+            # Создаём пустой output.txt, чтобы не было ошибок
+            with open(OUTPUT_FILE, 'w') as f:
                 f.write('')
             return
 
@@ -1501,6 +1407,7 @@ def main():
             p["is_proxy"] = False
             p["is_hosting"] = False
 
+        # Первичная генерация remark и URI (без бонуса за частоту)
         for p in alive:
             tags = []
             if p.get("is_hosting"): tags.append("🏢Datacenter")
@@ -1511,26 +1418,47 @@ def main():
                 remark += " | " + " ".join(tags)
             p["uri"] = rewrite_uri_fragment(p["uri"], remark)
 
+        # Сортировка по score (пока без бонуса)
         alive.sort(key=lambda x: x.get("score", 0), reverse=True)
-        write_output_txt(alive, OUTPUT_FILE)
 
-        # ── ОБНОВЛЕНИЕ ИСТОРИИ И СОХРАНЕНИЕ TOP30 ──────────────────────
+        # ── ОБНОВЛЕНИЕ ИСТОРИИ ──────────────────────────────────────────
         history = ProxyHistory()
         if alive:
             log.info("Обновление истории прокси...")
             history.update(alive)
-            history.write_top30(TOP30_FILE)
-            history.print_top30(history.get_top30())
         else:
             log.info("Нет живых прокси для обновления истории.")
-            with open(TOP30_FILE, 'w') as f:
-                f.write('')
+
+        # ── ДОБАВЛЕНИЕ БОНУСА ЗА ЧАСТОТУ ПОЯВЛЕНИЙ ──────────────────
+        if alive:
+            log.info("Добавляем бонус за частоту появлений (>=4 запусков)...")
+            for p in alive:
+                appearances = history.get_appearances(p)
+                if appearances >= APPEARANCE_BONUS_THRESHOLD:
+                    old_score = p["score"]
+                    p["score"] += APPEARANCE_BONUS_VALUE
+                    log.debug(f"Бонус для {p['host']}: {old_score} -> {p['score']} (appearances={appearances})")
+                    # обновляем remark и URI
+                    tags = []
+                    if p.get("is_hosting"): tags.append("🏢Datacenter")
+                    if p.get("is_proxy"): tags.append("🔄Proxy")
+                    flag = country_to_flag(p.get("country_code", "XX"))
+                    remark = f"{flag} {p.get('country', '?')} | 🔒{p.get('score', 0)}"
+                    if tags:
+                        remark += " | " + " ".join(tags)
+                    p["uri"] = rewrite_uri_fragment(p["uri"], remark)
+
+            # Пересортировка с новыми score
+            alive.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+        # Запись output.txt
+        write_output_txt(alive, OUTPUT_FILE)
 
         if "--print" in sys.argv:
             print_output(alive)
 
         elapsed = time.time() - t0
-        log.info(f"Готово: {len(alive)} прокси → {OUTPUT_FILE}, top30 → {TOP30_FILE} за {elapsed:.1f}с")
+        log.info(f"Готово: {len(alive)} прокси → {OUTPUT_FILE} за {elapsed:.1f}с")
 
     finally:
         signal.alarm(0)
