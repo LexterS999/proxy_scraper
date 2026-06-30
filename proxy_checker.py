@@ -96,9 +96,9 @@ SUPPORTED_SINGBOX_TRANSPORTS = {"tcp", "ws", "http", "quic", "grpc", "xhttp"}
 SOCKS_PORT_BASE = 20800
 
 # ---- Размер батча (динамический) ----
-BATCH_SIZE_MIN = 50
-BATCH_SIZE_MAX = 100
-BATCH_SIZE = 70
+BATCH_SIZE_MIN = 60
+BATCH_SIZE_MAX = 300
+BATCH_SIZE = 100
 
 # ---- Гео-API ----
 GEO_API_URLS = [
@@ -106,7 +106,7 @@ GEO_API_URLS = [
     "https://ipinfo.io/batch",
     "https://geoip-db.com/json/"
 ]
-GEO_API_SLEEP = 2.0
+GEO_API_SLEEP = 1.0
 
 # ---- TLS-проверка ----
 ENABLE_TLS_CHECK = True
@@ -1616,7 +1616,7 @@ def check_all_proxies(proxies, singbox_path):
     if not filtered:
         return []
 
-    alive = check_proxies_via_singbox(filtered, singbox_path)
+    alive = check_batch_via_singbox(filtered, singbox_path)
 
     for p in alive:
         p["score"] = compute_score(p)
