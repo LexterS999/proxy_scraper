@@ -2,7 +2,7 @@ name: Proxy Check
 
 on:
   schedule:
-    - cron: '0 */3 * * *'   # каждые 5 часов
+    - cron: '30 */3 * * *'
   workflow_dispatch:
 
 permissions:
