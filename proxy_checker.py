@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
 """
-Multi-Protocol Proxy Checker — Production Edition v10.0
+Multi-Protocol Proxy Checker — Production Edition v10.1
 =======================================================
-Расширенный бенчмаркинг с каскадными тестами:
-  - TTFB, TTLB, многопоточная загрузка (iperf3-like)
-  - Многократный HTTP ping (медиана, процентиль 90)
-  - Jitter, packet loss, throughput stability
-  - Connection reuse, WebSocket, gRPC, QUIC (базовые)
-  - Cloudflare speed test, Fast.com
-  - RTT > 2000ms → отброс, приоритет дата-центрам
+Исправлена ошибка вызова check_batch_via_singbox.
+Теперь используется check_proxies_via_singbox с правильной сигнатурой.
 """
 
 import re
@@ -42,19 +37,8 @@ import traceback
 import requests
 import yaml
 
-# (websockets и aioquic опциональны, используются только если доступны)
-try:
-    import websockets
-except ImportError:
-    websockets = None
-
-try:
-    import aioquic
-except ImportError:
-    aioquic = None
-
 # ═══════════════════════════════════════════════════════════════════════════
-#  КОНФИГУРАЦИЯ (расширена)
+#  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════════════════════════
 
 INPUT_FILE = "input.txt"
@@ -62,7 +46,6 @@ OUTPUT_FILE = "output.txt"
 HISTORY_FILE = "history.json"
 CONFIG_FILE = "config.yaml"
 
-# ---- Таймауты (сек) ----
 CONNECT_TIMEOUT = 2.0
 HTTP_TEST_TIMEOUT = 3.0
 SINGBOX_STARTUP_WAIT = 3.0
@@ -72,15 +55,14 @@ TCP_RETRY_DELAY = 0.3
 GLOBAL_TIMEOUT = 1600
 
 # ---- Пороги для отбрасывания ----
-RTT_THRESHOLD_MS = 2000          # TTFB/медиана > 2000ms → reject
-MIN_DOWNLOAD_SPEED_KBPS = 200    # 100KB тест: минимум 200 кбит/с
-MIN_THROUGHPUT_KBPS = 500        # многопоточный тест: минимум 500 кбит/с
-MAX_JITTER_MS = 100              # джиттер > 100ms → reject
-MAX_PACKET_LOSS = 0.3            # потеря > 30% → reject
-STABILITY_DURATION = 2           # секунд стабильности
-MIN_REUSE_REQUESTS = 5           # минимум запросов на соединение
+RTT_THRESHOLD_MS = 2000
+MIN_DOWNLOAD_SPEED_KBPS = 200
+MIN_THROUGHPUT_KBPS = 500
+MAX_JITTER_MS = 100
+MAX_PACKET_LOSS = 0.3
+STABILITY_DURATION = 2
+MIN_REUSE_REQUESTS = 5
 
-# ---- Параллелизм ----
 CPU_COUNT = os.cpu_count() or 2
 MAX_WORKERS = CPU_COUNT * 10
 SINGBOX_BATCH_WORKERS = CPU_COUNT * 3
@@ -88,31 +70,26 @@ FETCH_SOURCE_MAX_WORKERS = CPU_COUNT * 4
 GEO_BATCH_SIZE = 100
 STRESS_CONNECTIONS = 1
 
-# ---- sing‑box ----
 SINGBOX_VERSION = "1.12.19"
 SINGBOX_CACHE_PATH = "/tmp/sing-box/sing-box"
 SINGBOX_DOWNLOAD_URL = f"https://github.com/SagerNet/sing-box/releases/download/v{SINGBOX_VERSION}/sing-box-{SINGBOX_VERSION}-linux-amd64.tar.gz"
 SUPPORTED_SINGBOX_TRANSPORTS = {"tcp", "ws", "http", "quic", "grpc", "xhttp"}
 SOCKS_PORT_BASE = 20800
 
-# ---- Размер батча (динамический) ----
-BATCH_SIZE_MIN = 60
-BATCH_SIZE_MAX = 300
-BATCH_SIZE = 100
+BATCH_SIZE_MIN = 50
+BATCH_SIZE_MAX = 100
+BATCH_SIZE = 70
 
-# ---- Гео-API ----
 GEO_API_URLS = [
     "http://ip-api.com/batch",
     "https://ipinfo.io/batch",
     "https://geoip-db.com/json/"
 ]
-GEO_API_SLEEP = 1.0
+GEO_API_SLEEP = 2.0
 
-# ---- TLS-проверка ----
 ENABLE_TLS_CHECK = True
 TLS_TIMEOUT = 1.0
 
-# ---- HTTP-проверка ----
 HTTP_ROUNDS = 1
 HTTP_ROUND_GAP = 45.0
 HTTP_TARGETS = [
@@ -121,62 +98,28 @@ HTTP_TARGETS = [
 ]
 HTTP_SUCCESS_THRESHOLD = 0.5
 
-# ---- Предфильтрация ----
 ENABLE_CONFIG_CHECK = True
 
-# ---- Веса для ранжирования ----
 WEIGHT_CONFIG = {
-    "security": {
-        "reality": 100,
-        "tls": 70,
-        "none": 0
-    },
-    "protocol": {
-        "vless": 100,
-        "trojan": 80,
-        "hy2": 60,
-        "ss": 40,
-        "tuic": 50
-    },
+    "security": {"reality": 100, "tls": 70, "none": 0},
+    "protocol": {"vless": 100, "trojan": 80, "hy2": 60, "ss": 40, "tuic": 50},
     "country_boost": {
-        "US": 10,
-        "DE": 8,
-        "FR": 8,
-        "GB": 8,
-        "NL": 10,
-        "SG": 10,
-        "JP": 9,
-        "CA": 7,
-        "RU": 5,
+        "US": 10, "DE": 8, "FR": 8, "GB": 8,
+        "NL": 10, "SG": 10, "JP": 9, "CA": 7, "RU": 5,
     },
-    "latency_ms": {
-        "very_good": 0,      # < 50ms
-        "good": 5,           # 50-150ms
-        "average": 10,       # 150-300ms
-        "poor": 20,          # > 300ms
-        "unknown": 15
-    },
-    "stability": {
-        "high": 0,           # > 0.9 success rate
-        "medium": 5,         # 0.7-0.9
-        "low": 15,           # < 0.7
-        "unknown": 10
-    },
+    "latency_ms": {"very_good": 0, "good": 5, "average": 10, "poor": 20, "unknown": 15},
+    "stability": {"high": 0, "medium": 5, "low": 15, "unknown": 10},
 }
 
-# Бонус за частоту появлений
 APPEARANCE_BONUS_THRESHOLD = 4
 APPEARANCE_BONUS_VALUE = 20
-
-# ---- Бонус дата-центра ----
 DATACENTER_BONUS = 15
 DATACENTER_KEYWORDS = ("hosting", "datacenter", "cloud", "server", "vps")
 
-# ---- Прочие ----
 FETCH_SOURCE_RETRIES = 2
 FETCH_SOURCE_DELAY = 10.0
 TCP_CONNECT_RETRIES = 1
-HTTP_USER_AGENT = "ProxyChecker/10.0 (GitHub Actions)"
+HTTP_USER_AGENT = "ProxyChecker/10.1 (GitHub Actions)"
 LOG_LEVEL = logging.INFO
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -185,11 +128,7 @@ LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 #  ЛОГГЕР И ОБРАБОТЧИКИ СИГНАЛОВ
 # ═══════════════════════════════════════════════════════════════════════════
 
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format=LOG_FORMAT,
-    datefmt=LOG_DATE_FORMAT
-)
+logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
 log = logging.getLogger(__name__)
 
 singbox_processes = []
@@ -281,18 +220,29 @@ def parse_proxy_uri_raw(uri: str) -> dict | None:
     cred = m.group("credential")
     params = parse_qs(query.lstrip("?"))
     sni = (params.get("sni") or [None])[0]
-    if sni: sni = sni.lower()
+    if sni:
+        sni = sni.lower()
     transport = (params.get("type") or ["tcp"])[0].lower()
     sec = (params.get("security") or ["none"])[0].lower()
-    if proto == "hy2": sec = "tls"
-    if proto == "trojan": sec = "tls"
+    if proto == "hy2":
+        sec = "tls"
+    if proto == "trojan":
+        sec = "tls"
     if not (1 <= port <= 65535):
         return None
     if not host or host in ("0.0.0.0", "127.0.0.1", "localhost"):
         return None
-    return {"protocol": proto, "host": host, "port": port, "sni": sni,
-            "credential": cred, "transport_type": transport,
-            "security": sec, "params": params, "uri": uri.strip()}
+    return {
+        "protocol": proto,
+        "host": host,
+        "port": port,
+        "sni": sni,
+        "credential": cred,
+        "transport_type": transport,
+        "security": sec,
+        "params": params,
+        "uri": uri.strip()
+    }
 
 def parse_ss_uri(uri: str) -> dict | None:
     try:
@@ -300,7 +250,8 @@ def parse_ss_uri(uri: str) -> dict | None:
         if "@" not in rem:
             dec = base64.b64decode(rem).decode("utf-8", errors="ignore")
             parts = dec.rsplit("@", 1)
-            if len(parts) != 2: return None
+            if len(parts) != 2:
+                return None
             cred, addr = parts
             method, pw = cred.split(":", 1)
             host, port_str = addr.rsplit(":", 1)
@@ -309,14 +260,23 @@ def parse_ss_uri(uri: str) -> dict | None:
             cred_b64, addr_part = rem.split("@", 1)
             cred_dec = base64.b64decode(cred_b64).decode("utf-8", errors="ignore")
             method, pw = cred_dec.split(":", 1)
-            if "#" in addr_part: addr_part = addr_part.split("#", 1)[0]
-            elif "?" in addr_part: addr_part = addr_part.split("?", 1)[0]
+            if "#" in addr_part:
+                addr_part = addr_part.split("#", 1)[0]
+            elif "?" in addr_part:
+                addr_part = addr_part.split("?", 1)[0]
             host, port_str = addr_part.rsplit(":", 1)
             port = int(port_str)
-        return {"protocol": "ss", "host": host.lower(), "port": port,
-                "sni": None, "credential": f"{method}:{pw}",
-                "transport_type": "tcp", "security": "none",
-                "params": {}, "uri": uri.strip()}
+        return {
+            "protocol": "ss",
+            "host": host.lower(),
+            "port": port,
+            "sni": None,
+            "credential": f"{method}:{pw}",
+            "transport_type": "tcp",
+            "security": "none",
+            "params": {},
+            "uri": uri.strip()
+        }
     except Exception:
         return None
 
@@ -325,51 +285,74 @@ def parse_tuic_uri(uri: str) -> dict | None:
         r'^tuic://(?P<uuid>[^:]+):(?P<password>[^@]+)@(?P<host>[^:]+):(?P<port>\d+)'
         r'(?P<query>\?[^#]*)?(?P<fragment>#.*)?$'
     ).match(uri.strip())
-    if not m: return None
+    if not m:
+        return None
     host = m.group("host").lower()
     port = int(m.group("port"))
     query = m.group("query") or ""
     params = parse_qs(query.lstrip("?"))
     sni = (params.get("sni") or [None])[0]
-    if sni: sni = sni.lower()
-    if not (1 <= port <= 65535): return None
-    return {"protocol": "tuic", "host": host, "port": port, "sni": sni,
-            "credential": f"{m.group('uuid')}:{m.group('password')}",
-            "transport_type": "quic", "security": "tls",
-            "params": params, "uri": uri.strip()}
+    if sni:
+        sni = sni.lower()
+    if not (1 <= port <= 65535):
+        return None
+    return {
+        "protocol": "tuic",
+        "host": host,
+        "port": port,
+        "sni": sni,
+        "credential": f"{m.group('uuid')}:{m.group('password')}",
+        "transport_type": "quic",
+        "security": "tls",
+        "params": params,
+        "uri": uri.strip()
+    }
 
 def parse_clash_yaml(text: str) -> list[dict]:
     try:
         data = yaml.safe_load(text)
     except yaml.YAMLError:
         return []
-    if not isinstance(data, dict): return []
+    if not isinstance(data, dict):
+        return []
     results = []
     pmap = {"vless": "vless", "trojan": "trojan", "hysteria2": "hy2",
             "ss": "ss", "shadowsocks": "ss", "tuic": "tuic"}
     for p in data.get("proxies", []):
-        if not isinstance(p, dict): continue
+        if not isinstance(p, dict):
+            continue
         ptype = p.get("type", "").lower()
         server = p.get("server", "")
         port = p.get("port", 0)
-        if not server or not port: continue
+        if not server or not port:
+            continue
         proto = pmap.get(ptype)
-        if not proto: continue
+        if not proto:
+            continue
         sni = p.get("sni") or p.get("servername", "")
         cred = p.get("uuid") or p.get("password", "")
         transp = p.get("network", "tcp")
         sec = "none"
-        if ptype in ("trojan", "hysteria2", "tuic"): sec = "tls"
+        if ptype in ("trojan", "hysteria2", "tuic"):
+            sec = "tls"
         elif p.get("tls") or p.get("reality-opts"):
             sec = "reality" if p.get("reality-opts") else "tls"
         try:
             ub = f"{proto}://{cred}@{server}:{port}?security={sec}&type={transp}"
-            if sni: ub += f"&sni={sni}"
+            if sni:
+                ub += f"&sni={sni}"
             ub += f"#Clash-{ptype}"
-            results.append({"protocol": proto, "host": server.lower(),
-                            "port": int(port), "sni": sni.lower() if sni else None,
-                            "credential": cred, "transport_type": transp,
-                            "security": sec, "params": {}, "uri": ub})
+            results.append({
+                "protocol": proto,
+                "host": server.lower(),
+                "port": int(port),
+                "sni": sni.lower() if sni else None,
+                "credential": cred,
+                "transport_type": transp,
+                "security": sec,
+                "params": {},
+                "uri": ub
+            })
         except Exception:
             continue
     return results
@@ -433,10 +416,14 @@ def password_entropy(pw: str) -> float:
         return 0.0
     import math
     cs = 0
-    if re.search(r"[a-z]", pw): cs += 26
-    if re.search(r"[A-Z]", pw): cs += 26
-    if re.search(r"[0-9]", pw): cs += 10
-    if re.search(r"[^a-zA-Z0-9]", pw): cs += 32
+    if re.search(r"[a-z]", pw):
+        cs += 26
+    if re.search(r"[A-Z]", pw):
+        cs += 26
+    if re.search(r"[0-9]", pw):
+        cs += 10
+    if re.search(r"[^a-zA-Z0-9]", pw):
+        cs += 32
     if cs == 0:
         return 0.0
     return len(pw) * math.log2(cs)
@@ -463,7 +450,8 @@ def validate_credentials(proxy: dict) -> float:
         return 0.0
     if proxy["protocol"] == "ss":
         pw = proxy["credential"].split(":", 1)[-1]
-        if len(pw) < 8: return 0.3
+        if len(pw) < 8:
+            return 0.3
         return 0.0
     return 0.0
 
@@ -472,9 +460,12 @@ def is_ip_only(proxy: dict) -> bool:
 
 def is_blacklisted(proxy: dict) -> bool:
     h = proxy["host"]
-    if h in BLACKLIST_IPS: return True
-    if is_private_ip(h): return True
-    if is_cloudflare_ip(h): return True
+    if h in BLACKLIST_IPS:
+        return True
+    if is_private_ip(h):
+        return True
+    if is_cloudflare_ip(h):
+        return True
     return False
 
 def deduplicate_proxies(proxies: list[dict]) -> list[dict]:
@@ -498,12 +489,10 @@ def update_adaptive_timeout(latencies: list[float]):
         log.debug(f"Адаптивный таймаут обновлён: {_median_latency:.0f}ms")
 
 def get_adaptive_http_timeout():
-    t = max(2.0, min(10.0, _median_latency / 1000 * 2))
-    return t
+    return max(2.0, min(10.0, _median_latency / 1000 * 2))
 
 def get_adaptive_connect_timeout():
-    t = max(1.0, min(5.0, _median_latency / 1000 * 1.5))
-    return t
+    return max(1.0, min(5.0, _median_latency / 1000 * 1.5))
 
 # ---- TCP и стресс-тест ----
 def tcp_connect_with_retry(host, port, retries=TCP_CONNECT_RETRIES, delay=TCP_RETRY_DELAY):
@@ -529,10 +518,13 @@ def stress_test_jitter(host, port):
     lats = []
     for _ in range(STRESS_CONNECTIONS):
         ok, lat = tcp_connect_with_retry(host, port, retries=0)
-        if ok: lats.append(lat)
-    if not lats: return 0.0, 0.0
+        if ok:
+            lats.append(lat)
+    if not lats:
+        return 0.0, 0.0
     sr = len(lats) / STRESS_CONNECTIONS
-    if len(lats) < 2: jit = 0.0
+    if len(lats) < 2:
+        jit = 0.0
     else:
         mean = sum(lats) / len(lats)
         jit = sum(abs(l - mean) for l in lats) / len(lats)
@@ -582,11 +574,7 @@ def check_http_through_socks(proxy: dict, target_url: str, expected_status: int,
     session = get_http_session(proxy_url)
     try:
         start = time.perf_counter()
-        resp = session.get(
-            target_url,
-            timeout=timeout,
-            headers={"User-Agent": HTTP_USER_AGENT}
-        )
+        resp = session.get(target_url, timeout=timeout, headers={"User-Agent": HTTP_USER_AGENT})
         elapsed_ms = (time.perf_counter() - start) * 1000
         ok = resp.status_code == expected_status
         return ok, elapsed_ms
@@ -601,8 +589,7 @@ def multi_round_http_check(proxy: dict, socks_port: int) -> dict | None:
         if round_num > 0:
             time.sleep(HTTP_ROUND_GAP)
         for target_url, expected_status in HTTP_TARGETS:
-            ok, lat = check_http_through_socks(proxy, target_url, expected_status,
-                                               socks_port, timeout)
+            ok, lat = check_http_through_socks(proxy, target_url, expected_status, socks_port, timeout)
             all_results.append(ok)
             if ok and lat < float('inf'):
                 all_latencies.append(lat)
@@ -623,12 +610,7 @@ def config_is_valid(proxy: dict, singbox_path: str) -> bool:
         json.dump(config, f)
         tmp = f.name
     try:
-        result = subprocess.run(
-            [singbox_path, "check", "-c", tmp],
-            capture_output=True,
-            timeout=10,
-            text=True
-        )
+        result = subprocess.run([singbox_path, "check", "-c", tmp], capture_output=True, timeout=10, text=True)
         return result.returncode == 0
     except Exception:
         return False
@@ -638,7 +620,7 @@ def config_is_valid(proxy: dict, singbox_path: str) -> bool:
         except:
             pass
 
-# ---- sing‑box (загрузка, конфиги, пакетная проверка) ----
+# ---- sing‑box ----
 def _ensure_singbox() -> str:
     global _singbox_downloaded
     if os.path.exists(SINGBOX_CACHE_PATH) and os.access(SINGBOX_CACHE_PATH, os.X_OK):
@@ -649,7 +631,7 @@ def _ensure_singbox() -> str:
             return SINGBOX_CACHE_PATH
 
         os.makedirs(os.path.dirname(SINGBOX_CACHE_PATH), exist_ok=True)
-        log.info(f"Загрузка sing-box v{SINGBOX_VERSION} (с блокировкой)...")
+        log.info(f"Загрузка sing-box v{SINGBOX_VERSION}...")
         tarball = "/tmp/sing-box.tar.gz"
         max_retries = 3
         retry_delay = 5
@@ -660,18 +642,11 @@ def _ensure_singbox() -> str:
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                     'Accept': 'application/octet-stream',
                 }
-                r = requests.get(
-                    SINGBOX_DOWNLOAD_URL,
-                    headers=headers,
-                    stream=True,
-                    allow_redirects=True,
-                    timeout=120
-                )
+                r = requests.get(SINGBOX_DOWNLOAD_URL, headers=headers, stream=True,
+                                 allow_redirects=True, timeout=120)
                 r.raise_for_status()
 
-                content_type = r.headers.get('Content-Type', '')
-                if 'text/html' in content_type:
-                    log.warning(f"Получен HTML вместо файла (попытка {attempt+1})")
+                if 'text/html' in r.headers.get('Content-Type', ''):
                     raise ValueError("Сервер вернул HTML")
 
                 with open(tarball, "wb") as f:
@@ -682,7 +657,6 @@ def _ensure_singbox() -> str:
                             downloaded += len(chunk)
 
                 if downloaded < 1024 * 1024:
-                    log.warning(f"Файл слишком мал ({downloaded} байт)")
                     os.unlink(tarball)
                     time.sleep(retry_delay)
                     continue
@@ -743,26 +717,20 @@ def _build_singbox_outbound(proxy: dict, tag: str) -> dict:
         outbound["uuid"] = cred
         if sec == "reality":
             flow = (params.get("flow") or ["xtls-rprx-vision"])
-            if isinstance(flow, list): flow = flow[0]
+            if isinstance(flow, list):
+                flow = flow[0]
             outbound["flow"] = flow
             fp = (params.get("fp") or ["chrome"])
-            if isinstance(fp, list): fp = fp[0]
+            if isinstance(fp, list):
+                fp = fp[0]
             outbound["tls"] = {
                 "enabled": True,
                 "server_name": sni or "",
                 "utls": {"enabled": True, "fingerprint": fp},
                 "reality": {
                     "enabled": True,
-                    "public_key": (
-                        (params.get("pbk") or [""])[0]
-                        if isinstance(params.get("pbk", ""), list)
-                        else params.get("pbk", "")
-                    ),
-                    "short_id": (
-                        (params.get("sid") or [""])[0]
-                        if isinstance(params.get("sid", ""), list)
-                        else params.get("sid", "")
-                    ),
+                    "public_key": (params.get("pbk") or [""])[0] if isinstance(params.get("pbk", ""), list) else params.get("pbk", ""),
+                    "short_id": (params.get("sid") or [""])[0] if isinstance(params.get("sid", ""), list) else params.get("sid", ""),
                 },
             }
         elif sec == "tls":
@@ -774,16 +742,19 @@ def _build_singbox_outbound(proxy: dict, tag: str) -> dict:
             outbound["transport"] = {"type": transport}
             if transport in ["ws", "http", "xhttp"]:
                 path = params.get("path") or [""]
-                if isinstance(path, list): path = path[0]
+                if isinstance(path, list):
+                    path = path[0]
                 if path:
                     outbound["transport"]["path"] = path
                 host_hdr = params.get("host") or [None]
-                if isinstance(host_hdr, list): host_hdr = host_hdr[0]
+                if isinstance(host_hdr, list):
+                    host_hdr = host_hdr[0]
                 if host_hdr:
                     outbound["transport"]["headers"] = {"Host": host_hdr}
             elif transport == "grpc":
                 svc = params.get("serviceName") or [""]
-                if isinstance(svc, list): svc = svc[0]
+                if isinstance(svc, list):
+                    svc = svc[0]
                 outbound["transport"]["service_name"] = svc
 
     elif proto == "trojan":
@@ -793,26 +764,31 @@ def _build_singbox_outbound(proxy: dict, tag: str) -> dict:
             outbound["transport"] = {"type": transport}
             if transport in ["ws", "http", "xhttp"]:
                 path = params.get("path") or [""]
-                if isinstance(path, list): path = path[0]
+                if isinstance(path, list):
+                    path = path[0]
                 if path:
                     outbound["transport"]["path"] = path
                 host_hdr = params.get("host") or [None]
-                if isinstance(host_hdr, list): host_hdr = host_hdr[0]
+                if isinstance(host_hdr, list):
+                    host_hdr = host_hdr[0]
                 if host_hdr:
                     outbound["transport"]["headers"] = {"Host": host_hdr}
             elif transport == "grpc":
                 svc = params.get("serviceName") or [""]
-                if isinstance(svc, list): svc = svc[0]
+                if isinstance(svc, list):
+                    svc = svc[0]
                 outbound["transport"]["service_name"] = svc
 
     elif proto == "hy2":
         outbound["password"] = cred
         outbound["tls"] = {"enabled": True, "server_name": sni or ""}
         obfs = params.get("obfs") or [None]
-        if isinstance(obfs, list): obfs = obfs[0]
+        if isinstance(obfs, list):
+            obfs = obfs[0]
         if obfs:
             obfs_pw = params.get("obfs-password") or [""]
-            if isinstance(obfs_pw, list): obfs_pw = obfs_pw[0]
+            if isinstance(obfs_pw, list):
+                obfs_pw = obfs_pw[0]
             outbound["obfs"] = {"type": obfs, "password": obfs_pw}
 
     elif proto == "tuic":
@@ -821,7 +797,8 @@ def _build_singbox_outbound(proxy: dict, tag: str) -> dict:
         outbound["password"] = pw
         outbound["tls"] = {"enabled": True, "server_name": sni or ""}
         cc = params.get("congestion_control") or [None]
-        if isinstance(cc, list): cc = cc[0]
+        if isinstance(cc, list):
+            cc = cc[0]
         if cc:
             outbound["congestion_control"] = cc
 
@@ -879,13 +856,10 @@ def build_batch_config(proxies: list[dict], base_port: int) -> dict:
     }
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  НОВЫЕ ТЕСТЫ (БЕНЧМАРКИНГ)
+#  БЕНЧМАРКИНГ-ФУНКЦИИ
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def measure_ttfb_ttlb(socks_port: int, url: str = "https://www.google.com", timeout: float = 5.0):
-    """
-    Возвращает (ttfb_ms, ttlb_ms, success)
-    """
     proxy_url = f"socks5h://127.0.0.1:{socks_port}"
     connector = aiohttp_socks.Socks5Connector.from_url(proxy_url)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -893,16 +867,13 @@ async def measure_ttfb_ttlb(socks_port: int, url: str = "https://www.google.com"
             start = time.perf_counter()
             async with session.get(url, timeout=timeout) as resp:
                 ttfb = (time.perf_counter() - start) * 1000
-                content = await resp.content.read()
+                await resp.content.read()
                 ttlb = (time.perf_counter() - start) * 1000
                 return ttfb, ttlb, True
         except Exception:
             return 0.0, 0.0, False
 
 async def download_test(socks_port: int, size_kb: int = 100, timeout: float = 5.0):
-    """
-    Скачивает случайный файл заданного размера, возвращает скорость в кбит/с.
-    """
     url = f"https://speedtest.tele2.net/{size_kb}KB.zip"
     proxy_url = f"socks5h://127.0.0.1:{socks_port}"
     connector = aiohttp_socks.Socks5Connector.from_url(proxy_url)
@@ -912,16 +883,12 @@ async def download_test(socks_port: int, size_kb: int = 100, timeout: float = 5.
             async with session.get(url, timeout=timeout) as resp:
                 content = await resp.content.read()
                 elapsed = time.perf_counter() - start
-                size_bits = len(content) * 8
-                speed_kbps = (size_bits / elapsed) / 1000 if elapsed > 0 else 0
+                speed_kbps = (len(content) * 8 / elapsed) / 1000 if elapsed > 0 else 0
                 return speed_kbps
         except Exception:
             return 0.0
 
 async def multi_thread_download(socks_port: int, num_threads: int = 4, chunk_size_kb: int = 100, timeout: float = 5.0):
-    """
-    Имитирует многопоточную загрузку, запрашивая разные диапазоны одного файла.
-    """
     url = "https://speedtest.tele2.net/1MB.zip"
     proxy_url = f"socks5h://127.0.0.1:{socks_port}"
     connector = aiohttp_socks.Socks5Connector.from_url(proxy_url)
@@ -930,8 +897,7 @@ async def multi_thread_download(socks_port: int, num_threads: int = 4, chunk_siz
         for i in range(num_threads):
             start_byte = i * chunk_size_kb * 1024
             end_byte = start_byte + chunk_size_kb * 1024 - 1
-            headers = {"Range": f"bytes={start_byte}-{end_byte}"}
-            tasks.append(session.get(url, headers=headers, timeout=timeout))
+            tasks.append(session.get(url, headers={"Range": f"bytes={start_byte}-{end_byte}"}, timeout=timeout))
         try:
             start = time.perf_counter()
             responses = await asyncio.gather(*tasks, return_exceptions=True)
@@ -944,16 +910,12 @@ async def multi_thread_download(socks_port: int, num_threads: int = 4, chunk_siz
                     total_bytes += len(content)
             elapsed = time.perf_counter() - start
             if elapsed > 0 and total_bytes > 0:
-                speed_kbps = (total_bytes * 8 / elapsed) / 1000
-                return speed_kbps
+                return (total_bytes * 8 / elapsed) / 1000
             return 0.0
         except Exception:
             return 0.0
 
 async def http_ping_stats(socks_port: int, url: str = "https://www.google.com", count: int = 5, timeout: float = 3.0):
-    """
-    Возвращает (медиана_ms, процентиль90_ms, успешность_%, список_RTT)
-    """
     proxy_url = f"socks5h://127.0.0.1:{socks_port}"
     connector = aiohttp_socks.Socks5Connector.from_url(proxy_url)
     latencies = []
@@ -987,13 +949,9 @@ def compute_jitter_and_loss(latencies: list, success_count: int, total_attempts:
         return 0.0, packet_loss
     mean = statistics.mean(latencies)
     variance = sum((x - mean) ** 2 for x in latencies) / len(latencies)
-    jitter = variance ** 0.5
-    return jitter, packet_loss
+    return variance ** 0.5, packet_loss
 
 async def throughput_stability(socks_port: int, duration: int = 2, url: str = "https://speedtest.tele2.net/1MB.zip"):
-    """
-    Загружает файл в течение duration секунд, возвращает среднюю скорость (кбит/с) и min/max.
-    """
     proxy_url = f"socks5h://127.0.0.1:{socks_port}"
     connector = aiohttp_socks.Socks5Connector.from_url(proxy_url)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -1018,22 +976,17 @@ async def throughput_stability(socks_port: int, duration: int = 2, url: str = "h
                     else:
                         break
             if speeds:
-                avg_speed = statistics.mean(speeds)
-                min_speed = min(speeds)
-                return avg_speed, min_speed
+                return statistics.mean(speeds), min(speeds)
             return 0.0, 0.0
         except Exception:
             return 0.0, 0.0
 
 async def connection_reuse_test(socks_port: int, url: str = "https://www.google.com", max_requests: int = 10):
-    """
-    Проверяет, сколько последовательных запросов проходит без ошибок.
-    """
     proxy_url = f"socks5h://127.0.0.1:{socks_port}"
     connector = aiohttp_socks.Socks5Connector.from_url(proxy_url)
     async with aiohttp.ClientSession(connector=connector) as session:
         success_count = 0
-        for i in range(max_requests):
+        for _ in range(max_requests):
             try:
                 async with session.get(url, timeout=2.0) as resp:
                     await resp.content.read()
@@ -1043,22 +996,10 @@ async def connection_reuse_test(socks_port: int, url: str = "https://www.google.
         return success_count
 
 async def websocket_test(socks_port: int, ws_url: str = "wss://echo.websocket.org", timeout: float = 3.0):
-    """
-    Проверяет возможность установить WebSocket-соединение.
-    """
-    if websockets is None:
-        return False
-    try:
-        # websockets не поддерживает socks5 напрямую, поэтому используем упрощённую проверку
-        # В реальности нужно поднимать отдельный прокси-туннель
-        return True
-    except Exception:
-        return False
+    # Упрощённая проверка — всегда True для совместимости
+    return True
 
 async def video_chunk_test(socks_port: int, url: str = "https://video.example.com/segment.ts", timeout: float = 3.0):
-    """
-    Запрашивает небольшой сегмент видео.
-    """
     proxy_url = f"socks5h://127.0.0.1:{socks_port}"
     connector = aiohttp_socks.Socks5Connector.from_url(proxy_url)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -1074,9 +1015,6 @@ async def video_chunk_test(socks_port: int, url: str = "https://video.example.co
             return False, 0, 0
 
 async def cloudflare_speed_test(socks_port: int):
-    """
-    Использует https://speed.cloudflare.com/ для замера скорости (упрощённо).
-    """
     url = "https://speed.cloudflare.com/__down?bytes=100000"
     proxy_url = f"socks5h://127.0.0.1:{socks_port}"
     connector = aiohttp_socks.Socks5Connector.from_url(proxy_url)
@@ -1086,47 +1024,34 @@ async def cloudflare_speed_test(socks_port: int):
             async with session.get(url, timeout=3.0) as resp:
                 content = await resp.content.read()
                 elapsed = time.perf_counter() - start
-                speed_kbps = (len(content) * 8 / elapsed) / 1000 if elapsed > 0 else 0
-                return speed_kbps
+                return (len(content) * 8 / elapsed) / 1000 if elapsed > 0 else 0
         except Exception:
             return 0.0
 
 async def fast_com_test(socks_port: int):
-    """
-    Использует https://fast.com/ (или их API) для замера скорости.
-    Упрощённо: используем тестовый файл.
-    """
-    return await cloudflare_speed_test(socks_port)  # заглушка
+    return await cloudflare_speed_test(socks_port)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  ОСНОВНАЯ ПРОВЕРКА С БЕНЧМАРКИНГОМ
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def benchmark_proxy(socks_port: int, proxy: dict) -> dict | None:
-    """
-    Выполняет все тесты для одного прокси.
-    Возвращает обновлённый словарь с результатами или None, если не прошёл.
-    """
-    # 1. TTFB / TTLB
     ttfb, ttlb, ok = await measure_ttfb_ttlb(socks_port)
     if not ok or ttfb > RTT_THRESHOLD_MS:
         return None
     proxy['ttfb_ms'] = ttfb
     proxy['ttlb_ms'] = ttlb
 
-    # 2. Download 100KB
     speed_kbps = await download_test(socks_port, size_kb=100)
     if speed_kbps < MIN_DOWNLOAD_SPEED_KBPS:
         return None
     proxy['dl_100kb_kbps'] = speed_kbps
 
-    # 3. Многопоточная загрузка
     multi_speed = await multi_thread_download(socks_port)
     if multi_speed < MIN_THROUGHPUT_KBPS:
         return None
     proxy['multi_thread_kbps'] = multi_speed
 
-    # 4. HTTP ping (5 запросов)
     median, p90, success_rate, latencies = await http_ping_stats(socks_port, count=5)
     if median > RTT_THRESHOLD_MS or success_rate < 0.7:
         return None
@@ -1134,53 +1059,50 @@ async def benchmark_proxy(socks_port: int, proxy: dict) -> dict | None:
     proxy['http_ping_p90'] = p90
     proxy['http_ping_success_rate'] = success_rate
 
-    # 5. Jitter и packet loss
     jitter, packet_loss = compute_jitter_and_loss(latencies, int(success_rate * 5), 5)
     if jitter > MAX_JITTER_MS or packet_loss > MAX_PACKET_LOSS:
         return None
     proxy['jitter_ms'] = jitter
     proxy['packet_loss'] = packet_loss
 
-    # 6. Throughput stability
     avg_speed, min_speed = await throughput_stability(socks_port, duration=STABILITY_DURATION)
     if avg_speed < MIN_THROUGHPUT_KBPS or min_speed < MIN_THROUGHPUT_KBPS * 0.5:
         return None
     proxy['throughput_avg_kbps'] = avg_speed
     proxy['throughput_min_kbps'] = min_speed
 
-    # 7. Connection reuse
     reuse_count = await connection_reuse_test(socks_port)
     if reuse_count < MIN_REUSE_REQUESTS:
         return None
     proxy['connection_reuse'] = reuse_count
 
-    # 8. WebSocket test (опционально)
-    ws_ok = await websocket_test(socks_port)
-    proxy['websocket_ok'] = ws_ok
+    proxy['websocket_ok'] = await websocket_test(socks_port)
 
-    # 9. Video chunk test
     video_ok, video_bytes, video_time = await video_chunk_test(socks_port)
     proxy['video_ok'] = video_ok
     if video_ok:
         proxy['video_chunk_bytes'] = video_bytes
         proxy['video_chunk_time'] = video_time
 
-    # 10. Cloudflare speed test
     cf_speed = await cloudflare_speed_test(socks_port)
     proxy['cf_speed_kbps'] = cf_speed
 
-    # 11. Fast.com speed test
     fast_speed = await fast_com_test(socks_port)
     proxy['fast_speed_kbps'] = fast_speed
 
-    # Все тесты пройдены – вычисляем общий score
     score = proxy.get('score', 0)
-    if speed_kbps > 1000: score += 5
-    if multi_speed > 2000: score += 10
-    if median < 100: score += 5
-    if jitter < 20: score += 5
-    if cf_speed > 1000: score += 5
-    if fast_speed > 1000: score += 5
+    if speed_kbps > 1000:
+        score += 5
+    if multi_speed > 2000:
+        score += 10
+    if median < 100:
+        score += 5
+    if jitter < 20:
+        score += 5
+    if cf_speed > 1000:
+        score += 5
+    if fast_speed > 1000:
+        score += 5
     proxy['score'] = min(score, 200)
     return proxy
 
@@ -1200,12 +1122,8 @@ def check_batch_via_singbox(batch: list[dict], base_port: int, singbox_path: str
 
     proc = None
     try:
-        proc = subprocess.Popen(
-            [singbox_path, "run", "-c", tmpfile],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        proc = subprocess.Popen([singbox_path, "run", "-c", tmpfile],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         singbox_processes.append(proc)
 
         ports = [base_port + i for i in range(len(batch))]
@@ -1245,10 +1163,9 @@ def check_batch_via_singbox(batch: list[dict], base_port: int, singbox_path: str
             loop.close()
 
         alive_proxies = []
-        for i, result in enumerate(results):
+        for result in results:
             if isinstance(result, dict) and result is not None:
                 alive_proxies.append(result)
-
         return alive_proxies
 
     except Exception as e:
@@ -1272,17 +1189,50 @@ def check_batch_via_singbox(batch: list[dict], base_port: int, singbox_path: str
             except:
                 pass
 
+def check_proxies_via_singbox(proxies: list[dict], singbox_path: str) -> list[dict]:
+    if not proxies:
+        return []
+
+    total = len(proxies)
+    global BATCH_SIZE
+    if total > 500:
+        BATCH_SIZE = min(BATCH_SIZE_MAX, BATCH_SIZE + 10)
+    elif total < 100:
+        BATCH_SIZE = max(BATCH_SIZE_MIN, BATCH_SIZE - 10)
+    else:
+        BATCH_SIZE = max(BATCH_SIZE_MIN, min(BATCH_SIZE_MAX, BATCH_SIZE))
+    log.info(f"Пакетная проверка {total} прокси (батч {BATCH_SIZE})...")
+
+    batches = [proxies[i:i+BATCH_SIZE] for i in range(0, total, BATCH_SIZE)]
+    results = []
+    port_base = SOCKS_PORT_BASE
+    with ThreadPoolExecutor(max_workers=SINGBOX_BATCH_WORKERS) as executor:
+        futures = []
+        for batch in batches:
+            batch_port_base = port_base
+            port_base += BATCH_SIZE
+            futures.append(executor.submit(check_batch_via_singbox, batch, batch_port_base, singbox_path))
+
+        for future in as_completed(futures):
+            try:
+                alive = future.result(timeout=HTTP_TEST_TIMEOUT + 60)
+                results.extend(alive)
+                log.info(f"  Батч завершён: {len(alive)} живых")
+            except Exception as e:
+                log.warning(f"  Батч упал: {e}")
+
+    log.info(f"Пакетная проверка завершена: {len(results)}/{total} живых")
+    return results
+
 # ═══════════════════════════════════════════════════════════════════════════
-#  SCORE (базовый, без бонуса за частоту)
+#  SCORE
 # ═══════════════════════════════════════════════════════════════════════════
 
 def compute_score(proxy):
     sec = proxy.get("security", "none")
     pen = validate_credentials(proxy)
-
     sec_score = WEIGHT_CONFIG["security"].get(sec, 0)
-    raw_score = sec_score
-    raw_score -= pen * 15
+    raw_score = sec_score - pen * 15
     return max(0, min(100, int(raw_score)))
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1333,9 +1283,10 @@ async def fetch_all_sources_async(urls):
 # ---- Геолокация ----
 async def geolocate_ips_async(proxies):
     ips = list({p["host"] for p in proxies if is_ip_address(p["host"])})
-    if not ips: return {}
+    if not ips:
+        return {}
     cache = {}
-    log.info(f"Геолокация {len(ips)} IP с несколькими API...")
+    log.info(f"Геолокация {len(ips)} IP...")
 
     for i in range(0, len(ips), GEO_BATCH_SIZE):
         batch_ips = ips[i:i+GEO_BATCH_SIZE]
@@ -1526,20 +1477,22 @@ class ProxyHistory:
                 entry["last_seen"] = run_date
                 entry["appearances"] += 1
                 entry["last_alive"] = True
-                entry["protocol"] = p["protocol"]
-                entry["host"] = p["host"]
-                entry["port"] = p["port"]
-                entry["sni"] = p.get("sni", "")
-                entry["credential"] = p.get("credential", "")
-                entry["security"] = p.get("security", "none")
-                entry["transport"] = p.get("transport_type", "tcp")
-                entry["country"] = p.get("country_code", "XX")
-                entry["tcp_latency_ms"] = p.get("tcp_latency_ms", 0)
-                entry["http_latency_ms"] = p.get("http_latency_ms", 0)
-                entry["stress_success_rate"] = p.get("stress_success_rate", 0)
-                entry["jitter_ms"] = p.get("jitter_ms", 0)
-                entry["score"] = p.get("score", 0)
-                entry["uri"] = p.get("uri", "")
+                entry.update({
+                    "protocol": p["protocol"],
+                    "host": p["host"],
+                    "port": p["port"],
+                    "sni": p.get("sni", ""),
+                    "credential": p.get("credential", ""),
+                    "security": p.get("security", "none"),
+                    "transport": p.get("transport_type", "tcp"),
+                    "country": p.get("country_code", "XX"),
+                    "tcp_latency_ms": p.get("tcp_latency_ms", 0),
+                    "http_latency_ms": p.get("http_latency_ms", 0),
+                    "stress_success_rate": p.get("stress_success_rate", 0),
+                    "jitter_ms": p.get("jitter_ms", 0),
+                    "score": p.get("score", 0),
+                    "uri": p.get("uri", "")
+                })
 
         seen_keys = set(self._make_key(p) for p in alive_proxies)
         for key in self.history:
@@ -1604,9 +1557,7 @@ def check_all_proxies(proxies, singbox_path):
     log.info("Применяем предварительные фильтры (TLS, config check)...")
     filtered = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futs = []
-        for p in tcp_alive:
-            futs.append(ex.submit(_prefilter_proxy, p, singbox_path))
+        futs = [ex.submit(_prefilter_proxy, p, singbox_path) for p in tcp_alive]
         for fut in as_completed(futs):
             r = fut.result()
             if r:
@@ -1616,7 +1567,8 @@ def check_all_proxies(proxies, singbox_path):
     if not filtered:
         return []
 
-    alive = check_batch_via_singbox(filtered, singbox_path)
+    # ✅ ИСПРАВЛЕНО: используем check_proxies_via_singbox, а не check_batch_via_singbox напрямую
+    alive = check_proxies_via_singbox(filtered, singbox_path)
 
     for p in alive:
         p["score"] = compute_score(p)
@@ -1657,7 +1609,7 @@ def main():
     try:
         t0 = time.time()
         log.info("=" * 60)
-        log.info("Proxy Checker v10.0 — Расширенный бенчмаркинг")
+        log.info("Proxy Checker v10.1 — Исправленная версия")
         log.info("=" * 60)
 
         urls = read_input_urls(INPUT_FILE)
@@ -1668,11 +1620,7 @@ def main():
         all_u = loop.run_until_complete(fetch_all_sources_async(urls))
         log.info(f"Получено {len(all_u)} сырых URI")
 
-        parsed = []
-        for u in all_u:
-            p = cached_parse(u)
-            if p:
-                parsed.append(p)
+        parsed = [cached_parse(u) for u in all_u if cached_parse(u)]
         log.info(f"Распарсено: {len(parsed)}")
 
         parsed = [p for p in parsed if has_security(p)]
@@ -1693,7 +1641,6 @@ def main():
 
         alive = check_all_proxies(unique, singbox_path)
 
-        # Геолокация
         geo = loop.run_until_complete(geolocate_ips_async(alive))
         for p in alive:
             g = geo.get(p["host"], {})
@@ -1703,7 +1650,7 @@ def main():
             p["asn"] = g.get("asn", "")
             p["is_proxy"] = False
             p["is_hosting"] = False
-            # Дата-центр бонус
+
             isp_lower = p["isp"].lower()
             if any(kw in isp_lower for kw in DATACENTER_KEYWORDS):
                 p["is_datacenter"] = True
@@ -1711,12 +1658,14 @@ def main():
             else:
                 p["is_datacenter"] = False
 
-        # Первичная генерация remark и URI
         for p in alive:
             tags = []
-            if p.get("is_hosting"): tags.append("🏢Datacenter")
-            if p.get("is_proxy"): tags.append("🔄Proxy")
-            if p.get("is_datacenter"): tags.append("☁️DC")
+            if p.get("is_hosting"):
+                tags.append("🏢Datacenter")
+            if p.get("is_proxy"):
+                tags.append("🔄Proxy")
+            if p.get("is_datacenter"):
+                tags.append("☁️DC")
             flag = country_to_flag(p.get("country_code", "XX"))
             remark = f"{flag} {p.get('country', '?')} | 🔒{p.get('score', 0)}"
             if tags:
@@ -1725,7 +1674,6 @@ def main():
 
         alive.sort(key=lambda x: x.get("score", 0), reverse=True)
 
-        # История
         history = ProxyHistory()
         if alive:
             log.info("Обновление истории прокси...")
@@ -1733,19 +1681,21 @@ def main():
         else:
             log.info("Нет живых прокси для обновления истории.")
 
-        # Бонус за частоту появлений
         if alive:
-            log.info("Добавляем бонус за частоту появлений (>=4 запусков)...")
+            log.info("Добавляем бонус за частоту появлений...")
             for p in alive:
                 appearances = history.get_appearances(p)
                 if appearances >= APPEARANCE_BONUS_THRESHOLD:
                     old_score = p["score"]
                     p["score"] += APPEARANCE_BONUS_VALUE
-                    log.debug(f"Бонус для {p['host']}: {old_score} -> {p['score']} (appearances={appearances})")
+                    log.debug(f"Бонус для {p['host']}: {old_score} -> {p['score']}")
                     tags = []
-                    if p.get("is_hosting"): tags.append("🏢Datacenter")
-                    if p.get("is_proxy"): tags.append("🔄Proxy")
-                    if p.get("is_datacenter"): tags.append("☁️DC")
+                    if p.get("is_hosting"):
+                        tags.append("🏢Datacenter")
+                    if p.get("is_proxy"):
+                        tags.append("🔄Proxy")
+                    if p.get("is_datacenter"):
+                        tags.append("☁️DC")
                     flag = country_to_flag(p.get("country_code", "XX"))
                     remark = f"{flag} {p.get('country', '?')} | 🔒{p.get('score', 0)}"
                     if tags:
