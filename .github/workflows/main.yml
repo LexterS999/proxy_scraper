@@ -3,7 +3,7 @@ name: Proxy Check
 on:
   schedule:
     - cron: '0 */2 * * *'
-  workflow_dispatch:          # ручной запуск
+  workflow_dispatch:            # ручной запуск
 
 permissions:
   contents: write
@@ -21,7 +21,6 @@ jobs:
         with:
           python-version: '3.12'
 
-      # Кеш для pip – ускоряет установку зависимостей
       - name: Cache pip packages
         uses: actions/cache@v4
         with:
@@ -33,7 +32,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # Кеш для sing-box – бинарник скачивается один раз и переиспользуется
       - name: Cache sing-box
         uses: actions/cache@v4
         id: cache-singbox
@@ -41,26 +39,22 @@ jobs:
           path: /tmp/sing-box
           key: ${{ runner.os }}-singbox-v1.12.19
 
-      # Если кеш отсутствует, скрипт скачает его сам при первом запуске,
-      # но мы можем явно создать директорию, чтобы кеш сохранился
       - name: Prepare sing-box cache directory
         run: mkdir -p /tmp/sing-box
 
       - name: Run proxy checker
         run: python proxy_checker.py
+        env:
+          PYTHONUNBUFFERED: 1   # логи в реальном времени
 
-      # Коммитим только те файлы, которые действительно создаются скриптом
       - name: Commit updated files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          # Добавляем только существующие файлы, чтобы избежать ошибок
           for file in output.txt top30.txt history.json source_stats.json; do
             if [ -f "$file" ]; then
               git add "$file"
             fi
           done
-
           git diff --staged --quiet || git commit -m "Update proxy lists and history [skip ci]"
           git push
