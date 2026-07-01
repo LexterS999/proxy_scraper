@@ -73,6 +73,10 @@ GEO_API_TIMEOUT = 15.0
 TCP_RETRY_DELAY = 0.3
 GLOBAL_TIMEOUT = 1600
 
+# ---- TLS-проверка ----
+ENABLE_TLS_CHECK = True
+TLS_TIMEOUT = 1.0
+
 # ---- Параллелизм (адаптивный) ----
 CPU_COUNT = os.cpu_count() or 2
 
@@ -771,6 +775,7 @@ def _tcp_check(proxy: Proxy) -> Optional[Proxy]:
 # ── TLS-проверка (дополнительная) ──────────────────────────────────
 
 def tls_handshake_check(proxy: Proxy, timeout: float = TLS_TIMEOUT) -> Tuple[bool, Optional[Dict]]:
+    """Проверяет TLS напрямую (не через прокси) – оставлено для сбора информации"""
     import ssl
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
