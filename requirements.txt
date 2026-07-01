@@ -18,6 +18,3 @@ prometheus-client>=0.20.0
 # Optional for speed
 orjson>=3.10.0
 re2>=1.0.0
-
-# Sing-box (not a Python package, but we use it as binary)
-# The binary will be downloaded and cached in CI
