@@ -1,5 +1,5 @@
-requests>=2.25.0
-PyYAML>=5.4.0
-PySocks>=1.7.1
+requests>=2.31.0
+pyyaml>=6.0
 aiohttp>=3.9.0
 aiohttp-socks>=0.8.0
+psutil>=5.9.0
