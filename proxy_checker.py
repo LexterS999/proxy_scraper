@@ -15,6 +15,8 @@ Multi-Protocol Proxy Checker — Production Edition v10.0
   - Circuit breaker для внешних API
   - Type-safe модель Proxy (dataclass)
   - Адаптивный параллелизм под ресурсы CI-раннера
+  - Исправлен DeprecationWarning (SocksConnector → ProxyConnector)
+  - Уменьшен спам логов circuit breaker
 """
 
 import re
@@ -767,7 +769,8 @@ async def check_http_through_socks_async(proxy: Proxy, target_url: str, expected
                                          socks_port: int, timeout: float) -> Tuple[bool, float]:
     """Асинхронная проверка через SOCKS5."""
     proxy_url = f"socks5://127.0.0.1:{socks_port}"
-    connector = aiohttp_socks.SocksConnector.from_url(proxy_url)
+    # Используем ProxyConnector вместо устаревшего SocksConnector
+    connector = aiohttp_socks.ProxyConnector.from_url(proxy_url)
     timeout_obj = aiohttp.ClientTimeout(total=timeout)
     async with aiohttp.ClientSession(connector=connector, timeout=timeout_obj) as session:
         try:
@@ -1284,8 +1287,10 @@ def record_api_failure(api_name: str):
             count = 1
         api_failure_counters[api_name] = (count, now)
         if count >= API_FAILURE_THRESHOLD:
+            # Проверяем, был ли circuit уже открыт, чтобы не спамить warning
+            if api_name not in api_circuit_open or not api_circuit_open[api_name]:
+                log.warning(f"Circuit breaker открыт для {api_name}")
             api_circuit_open[api_name] = True
-            log.warning(f"Circuit breaker открыт для {api_name}")
 
 def record_api_success(api_name: str):
     if api_name in api_failure_counters:
