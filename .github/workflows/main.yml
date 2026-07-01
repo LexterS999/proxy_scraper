@@ -46,13 +46,6 @@ jobs:
       - name: Prepare sing-box cache directory
         run: mkdir -p /tmp/sing-box
 
-      # Создаём пустой config.yaml, если его нет (скрипт не требует, но для порядка)
-      - name: Ensure config.yaml exists
-        run: |
-          if [ ! -f config.yaml ]; then
-            echo "{}" > config.yaml
-          fi
-
       - name: Run proxy checker
         run: python proxy_checker.py
 
