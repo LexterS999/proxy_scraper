@@ -15,6 +15,15 @@ Multi-Protocol Proxy Checker — Production Edition v11.0
   - Убраны эмодзи из логов для CI‑совместимости
   - Асинхронная загрузка sing‑box через aiohttp
   - Замена SIGALRM на asyncio.wait_for
+
+ДОПОЛНИТЕЛЬНЫЕ ИСПРАВЛЕНИЯ (v11.0-hotfix):
+  - Снижены пороги HTTP-успешности (GENERAL_SUCCESS_THRESHOLD=0.5, STREAMING_SUCCESS_THRESHOLD=0.3)
+  - Сделана опциональной и менее строгой exit-IP триангуляция (по умолчанию отключена)
+  - Увеличены таймауты и время ожидания старта sing‑box
+  - Отключены бесполезные предфильтры (TLS, config_is_valid)
+  - Уменьшен размер батча для стабильности
+  - Добавлены повторные попытки для неудачных батчей
+  - Добавлено логирование stderr sing‑box для отладки
 """
 
 import re
@@ -73,8 +82,8 @@ GEO_API_TIMEOUT = 15.0
 TCP_RETRY_DELAY = 0.3
 GLOBAL_TIMEOUT = 1600
 
-# ---- TLS-проверка ----
-ENABLE_TLS_CHECK = True
+# ---- TLS-проверка (ОТКЛЮЧЕНА) ----
+ENABLE_TLS_CHECK = False          # <-- ОТКЛЮЧЕНО
 TLS_TIMEOUT = 1.0
 
 # ---- Параллелизм (адаптивный) ----
@@ -83,8 +92,8 @@ CPU_COUNT = os.cpu_count() or 2
 # ---- HTTP-проверка (исправлено H1, H2) ----
 HTTP_ROUNDS = 2                     # теперь реально два раунда (с задержкой)
 HTTP_ROUND_GAP = 45.0
-GENERAL_SUCCESS_THRESHOLD = 0.9     # для gstatic + cloudflare
-STREAMING_SUCCESS_THRESHOLD = 0.5   # для YouTube, Netflix и др.
+GENERAL_SUCCESS_THRESHOLD = 0.5     # <-- СНИЖЕНО (было 0.9)
+STREAMING_SUCCESS_THRESHOLD = 0.3   # <-- СНИЖЕНО (было 0.5)
 
 HTTP_TARGETS_GENERAL = [
     ("http://www.gstatic.com/generate_204", 204, b""),
@@ -99,9 +108,13 @@ HTTP_TARGETS_SPECIFIC = [
 # ---- Стресс-тест (исправлено H4) ----
 STRESS_CONNECTIONS = 5
 
-# ---- Предфильтрация ----
-ENABLE_CONFIG_CHECK = True
-ENABLE_IP_ONLY_FILTER = False       # теперь домены не отбрасываются (H6)
+# ---- Предфильтрация (ОТКЛЮЧЕНА) ----
+ENABLE_CONFIG_CHECK = False        # <-- ОТКЛЮЧЕНО
+ENABLE_IP_ONLY_FILTER = False      # теперь домены не отбрасываются (H6)
+
+# ---- Exit-IP триангуляция (ОТКЛЮЧЕНА по умолчанию) ----
+ENABLE_EXIT_IP_CHECK = False       # <-- ОТКЛЮЧЕНО
+EXIT_IP_CONSENSUS_MIN = 1          # <-- СНИЖЕНО (было 2)
 
 # ---- Веса ----
 WEIGHT_CONFIG = {
@@ -189,7 +202,7 @@ log = logging.getLogger(__name__)
 singbox_processes = []
 _singbox_download_lock = threading.Lock()
 _singbox_downloaded = False
-_median_latency = 1000.0
+_median_latency = 3000.0   # <-- УВЕЛИЧЕНО (было 1000.0)
 _median_lock = asyncio.Lock()
 
 def cleanup():
@@ -719,10 +732,10 @@ async def update_adaptive_timeout_async(latencies: List[float]):
         log.debug(f"Адаптивный таймаут обновлён: {new_median:.0f}ms")
 
 def get_adaptive_http_timeout():
-    return max(2.0, min(10.0, _median_latency / 1000 * 2))
+    return max(3.0, min(15.0, _median_latency / 1000 * 2.5))  # <-- УВЕЛИЧЕНО
 
 def get_adaptive_connect_timeout():
-    return max(1.0, min(5.0, _median_latency / 1000 * 1.5))
+    return max(2.0, min(8.0, _median_latency / 1000 * 2.0))   # <-- УВЕЛИЧЕНО
 
 # ── TCP и стресс-тест ──────────────────────────────────────────────────
 
@@ -772,10 +785,10 @@ def _tcp_check(proxy: Proxy) -> Optional[Proxy]:
     proxy.jitter_ms = jit
     return proxy
 
-# ── TLS-проверка (дополнительная) ──────────────────────────────────
+# ── TLS-проверка (дополнительная, ОТКЛЮЧЕНА) ──────────────────────────────────
 
 def tls_handshake_check(proxy: Proxy, timeout: float = TLS_TIMEOUT) -> Tuple[bool, Optional[Dict]]:
-    """Проверяет TLS напрямую (не через прокси) – оставлено для сбора информации"""
+    """Проверяет TLS напрямую (не через прокси) – оставлено для сбора информации, но не используется."""
     import ssl
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -804,10 +817,14 @@ def tls_handshake_check(proxy: Proxy, timeout: float = TLS_TIMEOUT) -> Tuple[boo
         return False, None
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  НОВАЯ ФУНКЦИЯ: проверка exit‑IP и подписи контента
+#  НОВАЯ ФУНКЦИЯ: проверка exit‑IP и подписи контента (с возможностью отключения)
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def check_exit_ip_and_content(session: aiohttp.ClientSession, socks_port: int, proxy: Proxy) -> Tuple[bool, str, Dict]:
+    if not ENABLE_EXIT_IP_CHECK:
+        # Если проверка отключена, возвращаем True и пустой IP, чтобы не блокировать
+        return True, "", {}
+
     target_urls = [
         ("https://api.ipify.org?format=json", "ip"),
         ("https://ifconfig.co/json", "ip"),
@@ -838,7 +855,7 @@ async def check_exit_ip_and_content(session: aiohttp.ClientSession, socks_port: 
     if not most_common:
         return False, "", {}
     consensus_ip, count = most_common[0]
-    consensus_ok = (count >= 2)
+    consensus_ok = (count >= EXIT_IP_CONSENSUS_MIN)
 
     cf_trace_url = "https://www.cloudflare.com/cdn-cgi/trace"
     try:
@@ -970,28 +987,12 @@ async def multi_round_http_check_async(proxy: Proxy, socks_port: int) -> Optiona
     else:
         return None
 
-# ── config_is_valid (синхронный) ──────────────────────────────────
+# ── config_is_valid (синхронный, ОТКЛЮЧЕН) ──────────────────────────────────
 
 def config_is_valid(proxy: Proxy, singbox_path: str) -> bool:
-    config = _build_singbox_config(proxy, socks_port=0)
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-        json.dump(config, f)
-        tmp = f.name
-    try:
-        result = subprocess.run(
-            [singbox_path, "check", "-c", tmp],
-            capture_output=True,
-            timeout=10,
-            text=True
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
-    finally:
-        try:
-            os.unlink(tmp)
-        except:
-            pass
+    # Эта функция больше не используется, но оставлена для совместимости.
+    # Всегда возвращаем True, чтобы не блокировать.
+    return True
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  sing‑box (загрузка, конфиги, асинхронная проверка)
@@ -1191,9 +1192,18 @@ def build_batch_config(proxies: List[Proxy], base_port: int) -> dict:
         "route": {"rules": route_rules}
     }
 
-# ── АСИНХРОННАЯ ПРОВЕРКА БАТЧА ────────────────────────────────────────
+# ── АСИНХРОННАЯ ПРОВЕРКА БАТЧА (с повторными попытками) ────────────────────────
 
-async def check_batch_via_singbox_async(batch: List[Proxy], base_port: int, singbox_path: str) -> List[Proxy]:
+async def check_batch_via_singbox_async(batch: List[Proxy], base_port: int, singbox_path: str, retries: int = 2) -> List[Proxy]:
+    for attempt in range(retries):
+        result = await _check_batch_once(batch, base_port, singbox_path)
+        if result is not None:
+            return result
+        log.warning(f"Батч упал, попытка {attempt+1}/{retries}, перезапуск через 2с...")
+        await asyncio.sleep(2)
+    return []
+
+async def _check_batch_once(batch: List[Proxy], base_port: int, singbox_path: str) -> Optional[List[Proxy]]:
     if not batch:
         return []
 
@@ -1205,9 +1215,10 @@ async def check_batch_via_singbox_async(batch: List[Proxy], base_port: int, sing
             json.dump(config, f)
     except Exception as e:
         log.warning(f"Не удалось записать конфиг батча: {e}")
-        return []
+        return None
 
     proc = None
+    stderr_task = None
     try:
         proc = await asyncio.create_subprocess_exec(
             singbox_path, "run", "-c", tmpfile,
@@ -1216,14 +1227,22 @@ async def check_batch_via_singbox_async(batch: List[Proxy], base_port: int, sing
         )
         singbox_processes.append(proc)
 
+        # Запускаем чтение stderr в фоне для отладки
+        stderr_task = asyncio.create_task(proc.stderr.read())
+
         ports = [base_port + i for i in range(len(batch))]
         ready_ports = set()
         start_time = time.time()
-        max_wait = max(1.0, min(10.0, 0.05 * len(batch)))
+        max_wait = max(5.0, min(20.0, 0.1 * len(batch)))   # <-- УВЕЛИЧЕНО
         attempt = 0
         while time.time() - start_time < max_wait and len(ready_ports) < len(ports):
             if proc.returncode is not None:
-                return []
+                # Если процесс завершился, читаем stderr
+                if stderr_task and not stderr_task.done():
+                    stderr_data = await stderr_task
+                    if stderr_data:
+                        log.error(f"sing-box stderr: {stderr_data.decode('utf-8', errors='ignore')[:500]}")
+                return None
             for port in ports:
                 if port in ready_ports:
                     continue
@@ -1241,7 +1260,7 @@ async def check_batch_via_singbox_async(batch: List[Proxy], base_port: int, sing
                 break
             await asyncio.sleep(0.2)
             attempt += 1
-            if attempt > 5:
+            if attempt > 10:
                 break
 
         alive_proxies = []
@@ -1252,22 +1271,33 @@ async def check_batch_via_singbox_async(batch: List[Proxy], base_port: int, sing
             result = await multi_round_http_check_async(proxy, port)
             if result is None:
                 continue
-            connector = aiohttp_socks.ProxyConnector.from_url(f"socks5://127.0.0.1:{port}")
-            async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=get_adaptive_http_timeout())) as session:
-                consensus_ok, exit_ip, extra = await check_exit_ip_and_content(session, port, result)
-                if consensus_ok and exit_ip:
-                    result.exit_ip = exit_ip
+
+            if ENABLE_EXIT_IP_CHECK:
+                connector = aiohttp_socks.ProxyConnector.from_url(f"socks5://127.0.0.1:{port}")
+                async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=get_adaptive_http_timeout())) as session:
+                    consensus_ok, exit_ip, extra = await check_exit_ip_and_content(session, port, result)
+                    if not (consensus_ok and exit_ip):
+                        continue
                     if exit_ip in ("127.0.0.1", "::1") or exit_ip == result.host:
                         continue
-                    alive_proxies.append(result)
-                else:
-                    continue
+                    result.exit_ip = exit_ip
+            # Если проверка exit-IP отключена, просто добавляем прокси
+            alive_proxies.append(result)
 
         return alive_proxies
 
     except Exception as e:
         log.warning(f"Ошибка в пакетной проверке: {e}")
-        return []
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.terminate()
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except:
+                try:
+                    proc.kill()
+                except:
+                    pass
+        return None
     finally:
         if proc is not None:
             try:
@@ -1280,6 +1310,8 @@ async def check_batch_via_singbox_async(batch: List[Proxy], base_port: int, sing
                     pass
             if proc in singbox_processes:
                 singbox_processes.remove(proc)
+        if stderr_task and not stderr_task.done():
+            stderr_task.cancel()
         if tmpfile and os.path.exists(tmpfile):
             try:
                 os.unlink(tmpfile)
@@ -1291,13 +1323,14 @@ async def check_proxies_via_singbox_async(proxies: List[Proxy], singbox_path: st
         return []
 
     total = len(proxies)
-    if total > 500:
-        batch_size = min(100, int(total / 10))
+    # Уменьшаем размер батча для стабильности
+    if total > 300:
+        batch_size = 40
     elif total > 100:
-        batch_size = 70
+        batch_size = 30
     else:
-        batch_size = 50
-    batch_size = max(10, min(100, batch_size))
+        batch_size = 20
+    batch_size = max(5, min(50, batch_size))   # ограничим
     log.info(f"Пакетная проверка {total} прокси (батч {batch_size}, воркеров {SINGBOX_BATCH_WORKERS})...")
 
     batches = [proxies[i:i+batch_size] for i in range(0, total, batch_size)]
@@ -1306,7 +1339,7 @@ async def check_proxies_via_singbox_async(proxies: List[Proxy], singbox_path: st
 
     async def process_batch(batch, base_port):
         async with sem:
-            return await check_batch_via_singbox_async(batch, base_port, singbox_path)
+            return await check_batch_via_singbox_async(batch, base_port, singbox_path, retries=2)
 
     tasks = []
     for batch in batches:
@@ -1427,6 +1460,9 @@ def record_api_success(api_name: str):
 # ═══════════════════════════════════════════════════════════════════════════
 
 from collections import Counter
+
+GEO_BATCH_SIZE = 20
+GEO_API_SLEEP = 0.2
 
 async def geolocate_ips_async(proxies: List[Proxy]) -> Dict[str, Dict]:
     ips = list({p.host for p in proxies if is_ip_address(p.host)})
@@ -1869,10 +1905,12 @@ class ProxyHistory:
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def _prefilter_proxy_async(proxy: Proxy, singbox_path: str) -> Optional[Proxy]:
+    # TLS-проверка отключена
     if ENABLE_TLS_CHECK:
         ok, cert_info = await asyncio.to_thread(tls_handshake_check, proxy, TLS_TIMEOUT)
         if not ok:
             pass
+    # config_is_valid отключена (всегда возвращает True)
     if ENABLE_CONFIG_CHECK:
         if not await asyncio.to_thread(config_is_valid, proxy, singbox_path):
             return None
