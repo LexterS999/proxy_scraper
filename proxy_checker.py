@@ -54,7 +54,7 @@ import requests
 import yaml
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  КОНФИГУРАЦИЯ (исправлена)
+#  КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════════════════════════
 
 INPUT_FILE = "input.txt"
@@ -99,31 +99,77 @@ STRESS_CONNECTIONS = 5
 ENABLE_CONFIG_CHECK = True
 ENABLE_IP_ONLY_FILTER = False       # теперь домены не отбрасываются (H6)
 
-# ---- Веса (без изменений) ----
-WEIGHT_CONFIG = { ... }  # (сохраняем как было)
+# ---- Веса ----
+WEIGHT_CONFIG = {
+    "security": {
+        "reality": 100,
+        "tls": 70,
+        "none": 0
+    },
+    "protocol": {
+        "vless": 100,
+        "trojan": 80,
+        "hy2": 60,
+        "ss": 40,
+        "tuic": 50
+    },
+    "country_boost": {
+        "US": 10,
+        "DE": 8,
+        "FR": 8,
+        "GB": 8,
+        "NL": 10,
+        "SG": 10,
+        "JP": 9,
+        "CA": 7,
+        "RU": 5,
+    },
+    "latency_ms": {
+        "very_good": 0,      # < 50ms
+        "good": 5,           # 50-150ms
+        "average": 10,       # 150-300ms
+        "poor": 20,          # > 300ms
+        "unknown": 15
+    },
+    "p95_latency": {
+        "very_good": 0,      # p95 < 80ms
+        "good": 5,           # p95 < 200ms
+        "average": 10,       # p95 < 400ms
+        "poor": 20,          # p95 >= 400ms
+    },
+    "stability": {
+        "high": 0,           # > 0.9 success rate
+        "medium": 5,         # 0.7-0.9
+        "low": 15,           # < 0.7
+        "unknown": 10
+    },
+    "appearance_bonus": 5,
+    "appearance_threshold": 3,
+    "age_penalty": 1,
+    "source_trust_bonus": 10,
+    "flapping_penalty": 15,
+    "ema_latency_weight": 0.3,
+}
 
 # ---- Circuit breaker (исправлено H8) ----
 API_FAILURE_THRESHOLD = 3
 API_FAILURE_WINDOW = 60
 API_HALF_OPEN_INTERVAL = 120        # через 120 сек пробуем восстановить
 
-api_failure_counters = {}   # {api_name: (fail_count, last_fail_time, circuit_open_time)}
-api_circuit_open = {}
+# ---- Прочие ----
+FETCH_SOURCE_RETRIES = 2
+FETCH_SOURCE_DELAY = 10.0
+TCP_CONNECT_RETRIES = 1             # <-- добавлено (было пропущено)
+HTTP_USER_AGENT = "ProxyChecker/11.0 (GitHub Actions)"
+LOG_LEVEL = logging.INFO
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 # ---- sing‑box ----
 SINGBOX_VERSION = "1.12.19"
 SINGBOX_CACHE_PATH = "/tmp/sing-box/sing-box"
 SINGBOX_DOWNLOAD_URL = f"https://github.com/SagerNet/sing-box/releases/download/v{SINGBOX_VERSION}/sing-box-{SINGBOX_VERSION}-linux-amd64.tar.gz"
-
-# ---- Гео-API ----
-GEO_API_URLS = [...]
-GEO_API_SLEEP = 2.0
-
-# ---- Прочие ----
-HTTP_USER_AGENT = "ProxyChecker/11.0 (GitHub Actions)"
-LOG_LEVEL = logging.INFO
-LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
-LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+SOCKS_PORT_BASE = 20800
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  ЛОГГЕР И ОБРАБОТЧИКИ СИГНАЛОВ
@@ -136,11 +182,11 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-singbox_processes = []   # список активных asyncio-процессов
+singbox_processes = []
 _singbox_download_lock = threading.Lock()
 _singbox_downloaded = False
 _median_latency = 1000.0
-_median_lock = asyncio.Lock()   # для защиты _median_latency (M2)
+_median_lock = asyncio.Lock()
 
 def cleanup():
     for proc in singbox_processes:
@@ -163,7 +209,7 @@ signal.signal(signal.SIGTERM, signal_handler)
 atexit.register(cleanup)
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  АДАПТИВНЫЙ ПАРАЛЛЕЛИЗМ (без изменений)
+#  АДАПТИВНЫЙ ПАРАЛЛЕЛИЗМ
 # ═══════════════════════════════════════════════════════════════════════════
 
 def calculate_workers():
@@ -186,7 +232,7 @@ def calculate_workers():
 MAX_WORKERS, SINGBOX_BATCH_WORKERS, FETCH_SOURCE_MAX_WORKERS = calculate_workers()
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  TYPE-SAFE МОДЕЛЬ PROXY (добавлены новые поля)
+#  TYPE-SAFE МОДЕЛЬ PROXY
 # ═══════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -201,7 +247,6 @@ class Proxy:
     params: Dict[str, Any] = field(default_factory=dict)
     uri: str = ""
 
-    # Метрики
     tcp_latency_ms: float = 0.0
     stress_success_rate: float = 0.0
     jitter_ms: float = 0.0
@@ -209,40 +254,26 @@ class Proxy:
     http_latencies: List[float] = field(default_factory=list)
     http_success_rate: float = 0.0
     p95_latency_ms: float = 0.0
-    ttfb_ms: float = 0.0          # время до первого байта (новое)
+    ttfb_ms: float = 0.0
     score: int = 0
 
-    # Гео
     country_code: str = "XX"
     country: str = "Unknown"
     isp: str = ""
     asn: str = ""
     is_proxy: bool = False
     is_hosting: bool = False
-
-    # Honeypot (H3)
     is_honeypot_suspect: bool = False
-
-    # Exit IP (для triangulation)
     exit_ip: str = ""
-
-    # Теги разблокировки (новое)
     unlocks_netflix: bool = False
     unlocks_youtube: bool = False
     unlocks_openai: bool = False
 
-    # Источник
     source_url: Optional[str] = None
-
-    # EMA
     ema_latency: Optional[float] = None
-
-    # Статистика
     appearances: int = 0
     last_seen: Optional[str] = None
     last_alive_history: List[bool] = field(default_factory=list)
-
-    # Флаг реальной живости (рассчитывается на основе всех проверок)
     alive: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
@@ -294,12 +325,28 @@ class Proxy:
         return proxy
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (исправлены)
+#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ═══════════════════════════════════════════════════════════════════════════
 
-PRIVATE_RANGES = [...]
-CLOUDFLARE_RANGES = [...]
-BLACKLIST_IPS = {"1.1.1.1", ...}
+PRIVATE_RANGES = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("224.0.0.0/4"),
+    ipaddress.ip_network("240.0.0.0/4"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+]
+CLOUDFLARE_RANGES = [
+    ipaddress.ip_network("104.16.0.0/13"),
+    ipaddress.ip_network("172.64.0.0/13"),
+    ipaddress.ip_network("162.158.0.0/15"),
+]
+BLACKLIST_IPS = {"1.1.1.1", "8.8.8.8", "8.8.4.4", "9.9.9.9", "149.112.112.112"}
 FLAG_OFFSET = 127397
 
 _parse_cache = {}
@@ -315,7 +362,6 @@ def cached_parse(uri: str, source_url: Optional[str] = None) -> Optional[Proxy]:
     return parse_proxy_uri_raw(uri, source_url)
 
 def get_first(params: Dict, key: str, default=None):
-    """Утилита для извлечения первого значения из списка (M12)"""
     val = params.get(key, default)
     if isinstance(val, list):
         return val[0] if val else default
@@ -372,7 +418,6 @@ def parse_proxy_uri_raw(uri: str, source_url: Optional[str] = None) -> Optional[
     )
 
 def parse_ss_uri(uri: str, source_url: Optional[str] = None) -> Optional[Proxy]:
-    """Поддержка plugin-параметров (M9)"""
     try:
         rem = uri[5:]
         if "@" not in rem:
@@ -391,10 +436,6 @@ def parse_ss_uri(uri: str, source_url: Optional[str] = None) -> Optional[Proxy]:
                 cred_part, param_str = cred_dec.split("?", 1)
                 params = parse_qs(param_str)
                 plugin = get_first(params, "plugin")
-                if plugin:
-                    # plugin=obfs-local;obfs=http;obfs-host=...
-                    # мы не пытаемся парсить, просто сохраним в params
-                    pass
             else:
                 cred_part = cred_dec
                 params = {}
@@ -406,11 +447,9 @@ def parse_ss_uri(uri: str, source_url: Optional[str] = None) -> Optional[Proxy]:
             elif "?" in addr_part:
                 addr_part, extra = addr_part.split("?", 1)
                 extra_params = parse_qs(extra)
-                # объединяем
                 params.update(extra_params)
             host, port_str = addr_part.rsplit(":", 1)
             port = int(port_str)
-        # сохраним plugin в params
         if plugin:
             params["plugin"] = plugin
         return Proxy(
@@ -442,7 +481,6 @@ def parse_tuic_uri(uri: str, source_url: Optional[str] = None) -> Optional[Proxy
     if sni: sni = sni.lower()
     if not (1 <= port <= 65535):
         return None
-    # Проверка UUID (M15)
     uuid_str = m.group("uuid")
     if not validate_uuid(uuid_str):
         return None
@@ -460,7 +498,6 @@ def parse_tuic_uri(uri: str, source_url: Optional[str] = None) -> Optional[Proxy
     )
 
 def parse_clash_yaml(text: str, source_url: Optional[str] = None) -> List[Proxy]:
-    """Улучшенный парсинг Clash: vmess, ws-headers, grpc (M10)"""
     try:
         data = yaml.safe_load(text)
     except yaml.YAMLError:
@@ -483,7 +520,6 @@ def parse_clash_yaml(text: str, source_url: Optional[str] = None) -> List[Proxy]
         proto = pmap.get(ptype)
         if not proto:
             continue
-        # Собираем общие параметры
         sni = p.get("sni") or p.get("servername", "")
         transport = p.get("network", "tcp")
         sec = "none"
@@ -492,32 +528,22 @@ def parse_clash_yaml(text: str, source_url: Optional[str] = None) -> List[Proxy]
         elif p.get("tls") or p.get("reality-opts"):
             sec = "reality" if p.get("reality-opts") else "tls"
 
-        # Для vmess нужно отдельно
         if proto == "vmess":
-            uuid = p.get("uuid", "")
-            alterId = p.get("alterId", 0)
-            cipher = p.get("cipher", "auto")
-            # формируем uri как vmess://... (поддерживается?)
-            # Для простоты пропускаем vmess, т.к. он требует base64 кодирования
-            # Можно сгенерировать vless-подобный? Нет, лучше пропустить.
+            # Пропускаем vmess для простоты (можно добавить позже)
             continue
 
-        # Для остальных
         cred = p.get("uuid") or p.get("password", "")
-        # Обработка ws-headers
         if transport == "ws":
             headers = p.get("ws-headers", {})
             host_header = headers.get("Host", "")
         else:
             host_header = ""
 
-        # Обработка grpc
         if transport == "grpc":
             service_name = p.get("service-name", "")
         else:
             service_name = ""
 
-        # Формируем URI (в упрощённом виде)
         params = {}
         if p.get("reality-opts"):
             params["pbk"] = p.get("reality-opts", {}).get("public-key", "")
@@ -532,7 +558,6 @@ def parse_clash_yaml(text: str, source_url: Optional[str] = None) -> List[Proxy]
             params["obfs"] = p.get("obfs")
             params["obfs-password"] = p.get("obfs-password", "")
 
-        # Собираем URI строку
         uri = f"{proto}://{cred}@{server}:{port}?security={sec}&type={transport}"
         if sni:
             uri += f"&sni={sni}"
@@ -555,7 +580,6 @@ def parse_clash_yaml(text: str, source_url: Optional[str] = None) -> List[Proxy]
     return results
 
 def country_to_flag(code: str) -> str:
-    # Оставлено для совместимости, но в логах не используем
     if not code or len(code) != 2:
         return "??"
     try:
@@ -636,7 +660,6 @@ def validate_reality_params(proxy: Proxy) -> bool:
     return True
 
 def credential_penalty(proxy: Proxy) -> float:
-    """Возвращает штраф от 0 до 1 (M8)"""
     if proxy.protocol == "vless":
         return 0.0 if validate_uuid(proxy.credential) else 0.5
     if proxy.protocol in ("trojan", "hy2", "tuic"):
@@ -665,16 +688,13 @@ def is_blacklisted(proxy: Proxy) -> bool:
     return False
 
 def normalize_params(params: Dict) -> str:
-    """Нормализует параметры для дедупликации (H7)"""
     items = sorted((k, v if isinstance(v, str) else str(v)) for k, v in params.items())
     return json.dumps(items, sort_keys=True)
 
 def deduplicate_proxies(proxies: List[Proxy]) -> List[Proxy]:
-    """Нормализованная дедупликация с учётом sni и параметров (H7, M11)"""
     seen = set()
     unique = []
     for p in proxies:
-        # Нормализуем параметры, исключая те, что могут быть вариативны (например, flow)
         params_sorted = sorted((k, get_first(p.params, k, "")) for k in p.params if k not in ("flow", "fp"))
         param_str = json.dumps(params_sorted, sort_keys=True)
         key = f"{p.protocol}|{p.host}|{p.port}|{p.credential}|{p.transport_type}|{p.security}|{p.sni or ''}|{param_str}"
@@ -683,7 +703,7 @@ def deduplicate_proxies(proxies: List[Proxy]) -> List[Proxy]:
             unique.append(p)
     return unique
 
-# ── Адаптивный таймаут (с блокировкой) ──────────────────────────────
+# ── Адаптивный таймаут ──────────────────────────────────────────────
 
 async def update_adaptive_timeout_async(latencies: List[float]):
     global _median_latency
@@ -700,7 +720,7 @@ def get_adaptive_http_timeout():
 def get_adaptive_connect_timeout():
     return max(1.0, min(5.0, _median_latency / 1000 * 1.5))
 
-# ── TCP и стресс-тест (синхронные) ──────────────────────────────────
+# ── TCP и стресс-тест ──────────────────────────────────────────────────
 
 def tcp_connect_with_retry(host, port, retries=TCP_CONNECT_RETRIES, delay=TCP_RETRY_DELAY):
     timeout = get_adaptive_connect_timeout()
@@ -748,10 +768,9 @@ def _tcp_check(proxy: Proxy) -> Optional[Proxy]:
     proxy.jitter_ms = jit
     return proxy
 
-# ── TLS-проверка (оставлена, но только как дополнительная) ──────────
+# ── TLS-проверка (дополнительная) ──────────────────────────────────
 
 def tls_handshake_check(proxy: Proxy, timeout: float = TLS_TIMEOUT) -> Tuple[bool, Optional[Dict]]:
-    """Проверяет TLS напрямую (не через прокси) – оставлено для сбора информации"""
     import ssl
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -780,14 +799,10 @@ def tls_handshake_check(proxy: Proxy, timeout: float = TLS_TIMEOUT) -> Tuple[boo
         return False, None
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  НОВАЯ ФУНКЦИЯ: проверка exit‑IP и подписи контента (A1, A2, B2)
+#  НОВАЯ ФУНКЦИЯ: проверка exit‑IP и подписи контента
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def check_exit_ip_and_content(session: aiohttp.ClientSession, socks_port: int, proxy: Proxy) -> Tuple[bool, str, Dict]:
-    """
-    Проверяет exit‑IP через несколько сервисов, а также анализирует cloudflare‑trace.
-    Возвращает (consensus_ok, exit_ip, extra_info)
-    """
     target_urls = [
         ("https://api.ipify.org?format=json", "ip"),
         ("https://ifconfig.co/json", "ip"),
@@ -797,8 +812,6 @@ async def check_exit_ip_and_content(session: aiohttp.ClientSession, socks_port: 
     extra = {}
     timeout = get_adaptive_http_timeout()
     connector = aiohttp_socks.ProxyConnector.from_url(f"socks5://127.0.0.1:{socks_port}")
-    # Используем переданную сессию или создаём новую с этим коннектором
-    # Но сессия уже может быть с другим коннектором, поэтому создадим отдельную
     async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=timeout)) as tmp_session:
         for url, key in target_urls:
             try:
@@ -814,16 +827,14 @@ async def check_exit_ip_and_content(session: aiohttp.ClientSession, socks_port: 
     if not exit_ips:
         return False, "", {}
 
-    # Проверяем консенсус: большинство одинаковых
     from collections import Counter
     counter = Counter(exit_ips)
     most_common = counter.most_common(1)
     if not most_common:
         return False, "", {}
     consensus_ip, count = most_common[0]
-    consensus_ok = (count >= 2)   # минимум 2 из 3
+    consensus_ok = (count >= 2)
 
-    # Дополнительно проверяем cloudflare-trace (B2)
     cf_trace_url = "https://www.cloudflare.com/cdn-cgi/trace"
     try:
         async with tmp_session.get(cf_trace_url, headers={"User-Agent": HTTP_USER_AGENT}) as resp:
@@ -835,11 +846,9 @@ async def check_exit_ip_and_content(session: aiohttp.ClientSession, socks_port: 
                     if "=" in line:
                         k, v = line.split("=", 1)
                         cf_data[k.strip()] = v.strip()
-                # Извлекаем warp, loc, etc.
                 extra["warp"] = cf_data.get("warp", "off")
                 extra["cf_loc"] = cf_data.get("loc", "XX")
                 extra["cf_ip"] = cf_data.get("ip", "")
-                # Проверяем, совпадает ли cf_ip с exit_ip
                 if extra.get("cf_ip") and extra["cf_ip"] == consensus_ip:
                     extra["cf_consensus"] = True
                 else:
@@ -850,14 +859,12 @@ async def check_exit_ip_and_content(session: aiohttp.ClientSession, socks_port: 
     return consensus_ok, consensus_ip, extra
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  HTTP-ПРОВЕРКА (переработана: раздельные пороги, TTFB, теги)
+#  HTTP-ПРОВЕРКА (переработана)
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def check_http_through_socks_async(session: aiohttp.ClientSession, target_url: str,
                                          expected_status: int, socks_port: int, timeout: float) -> Tuple[bool, float, float, bytes]:
-    """Возвращает (ok, total_latency_ms, ttfb_ms, body)"""
     connector = aiohttp_socks.ProxyConnector.from_url(f"socks5://127.0.0.1:{socks_port}")
-    # Создаём временную сессию с этим коннектором, чтобы не мешать основной
     async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=timeout)) as tmp_session:
         try:
             start = time.perf_counter()
@@ -871,22 +878,15 @@ async def check_http_through_socks_async(session: aiohttp.ClientSession, target_
             return False, float('inf'), float('inf'), b''
 
 async def multi_round_http_check_async(proxy: Proxy, socks_port: int) -> Optional[Proxy]:
-    """
-    Многораундовая HTTP-проверка с раздельными порогами.
-    Возвращает обновлённый Proxy (с заполненными метриками и тегами) или None.
-    """
     all_latencies = []
     all_ttfbs = []
-    results_general = []   # булевы для общих целей
-    results_specific = []  # булевы для стриминга
-    specific_names = []    # названия стриминговых целей (для тегов)
+    results_general = []
+    results_specific = []
+    specific_names = []
 
     timeout = get_adaptive_http_timeout()
-
-    # Используем одну сессию для всех запросов в рамках прокси (D1)
     connector = aiohttp_socks.ProxyConnector.from_url(f"socks5://127.0.0.1:{socks_port}")
     async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=timeout)) as session:
-        # Раунды для общих целей
         for round_num in range(HTTP_ROUNDS):
             if round_num > 0:
                 await asyncio.sleep(HTTP_ROUND_GAP)
@@ -898,7 +898,6 @@ async def multi_round_http_check_async(proxy: Proxy, socks_port: int) -> Optiona
                 if ok:
                     all_latencies.append(total_lat)
                     all_ttfbs.append(ttfb)
-                    # Проверка содержания для cloudflare-trace (B2)
                     if target_url == "https://www.cloudflare.com/cdn-cgi/trace":
                         try:
                             text = body.decode('utf-8')
@@ -908,12 +907,10 @@ async def multi_round_http_check_async(proxy: Proxy, socks_port: int) -> Optiona
                                 if "=" in line:
                                     k, v = line.split("=", 1)
                                     cf_data[k.strip()] = v.strip()
-                            # Сохраняем в proxy для дальнейшего анализа
                             proxy.params["cf_trace"] = cf_data
                         except:
                             pass
 
-        # Раунды для стриминговых целей
         for round_num in range(HTTP_ROUNDS):
             if round_num > 0:
                 await asyncio.sleep(HTTP_ROUND_GAP)
@@ -927,11 +924,9 @@ async def multi_round_http_check_async(proxy: Proxy, socks_port: int) -> Optiona
                     all_latencies.append(total_lat)
                     all_ttfbs.append(ttfb)
 
-    # Расчёт успешности
     general_ok = sum(results_general) / len(results_general) if results_general else 0.0
     specific_ok = sum(results_specific) / len(results_specific) if results_specific else 0.0
 
-    # Проверка на honeypot (аномально низкая задержка)
     if all_latencies and len(all_latencies) >= 3:
         median = statistics.median(all_latencies)
         stddev = statistics.stdev(all_latencies) if len(all_latencies) > 1 else 0.0
@@ -939,7 +934,6 @@ async def multi_round_http_check_async(proxy: Proxy, socks_port: int) -> Optiona
             proxy.is_honeypot_suspect = True
             log.warning(f"Honeypot suspect: {proxy.host}:{proxy.port} median={median:.1f}ms, std={stddev:.1f}ms")
 
-    # Определяем, жив ли прокси
     if general_ok >= GENERAL_SUCCESS_THRESHOLD and specific_ok >= STREAMING_SUCCESS_THRESHOLD and all_latencies:
         proxy.alive = True
         median_lat = statistics.median(all_latencies)
@@ -950,23 +944,19 @@ async def multi_round_http_check_async(proxy: Proxy, socks_port: int) -> Optiona
 
         proxy.http_latency_ms = median_lat
         proxy.http_latencies = all_latencies
-        proxy.http_success_rate = general_ok  # или общая? используем общую
+        proxy.http_success_rate = general_ok
         proxy.p95_latency_ms = p95_lat
         proxy.ttfb_ms = median_ttfb
 
-        # Теги разблокировки (B1)
-        if len(results_specific) >= len(HTTP_TARGETS_SPECIFIC):
-            # Проверяем первые N (соответствует порядку)
-            for i, (name, ok) in enumerate(zip(specific_names, results_specific)):
-                if ok:
-                    if name == "youtube":
-                        proxy.unlocks_youtube = True
-                    elif name == "netflix":
-                        proxy.unlocks_netflix = True
-                    elif name == "openai":
-                        proxy.unlocks_openai = True
+        for i, (name, ok) in enumerate(zip(specific_names, results_specific)):
+            if ok:
+                if name == "youtube":
+                    proxy.unlocks_youtube = True
+                elif name == "netflix":
+                    proxy.unlocks_netflix = True
+                elif name == "openai":
+                    proxy.unlocks_openai = True
 
-        # Проверка sane TTFB (4 уровень)
         if median_ttfb < 20 or median_ttfb > 5000:
             proxy.is_honeypot_suspect = True
 
@@ -999,11 +989,10 @@ def config_is_valid(proxy: Proxy, singbox_path: str) -> bool:
             pass
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  sing‑box (загрузка, конфиги, асинхронная проверка) (исправлено)
+#  sing‑box (загрузка, конфиги, асинхронная проверка)
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def _ensure_singbox_async() -> str:
-    """Асинхронная загрузка sing‑box через aiohttp (M13)"""
     global _singbox_downloaded
     if os.path.exists(SINGBOX_CACHE_PATH) and os.access(SINGBOX_CACHE_PATH, os.X_OK):
         return SINGBOX_CACHE_PATH
@@ -1093,7 +1082,6 @@ def _build_singbox_outbound(proxy: Proxy, tag: str) -> dict:
         "network": ["tcp", "udp"],
     }
 
-    # Используем get_first для извлечения параметров
     if proto == "vless":
         outbound["uuid"] = cred
         if sec == "reality":
@@ -1198,10 +1186,9 @@ def build_batch_config(proxies: List[Proxy], base_port: int) -> dict:
         "route": {"rules": route_rules}
     }
 
-# ── АСИНХРОННАЯ ПРОВЕРКА БАТЧА (исправлена) ──────────────────────────
+# ── АСИНХРОННАЯ ПРОВЕРКА БАТЧА ────────────────────────────────────────
 
 async def check_batch_via_singbox_async(batch: List[Proxy], base_port: int, singbox_path: str) -> List[Proxy]:
-    """Асинхронная проверка батча с retry и удалением процессов (H5, H9)"""
     if not batch:
         return []
 
@@ -1217,19 +1204,17 @@ async def check_batch_via_singbox_async(batch: List[Proxy], base_port: int, sing
 
     proc = None
     try:
-        # Запускаем sing-box
         proc = await asyncio.create_subprocess_exec(
             singbox_path, "run", "-c", tmpfile,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        singbox_processes.append(proc)   # для очистки
+        singbox_processes.append(proc)
 
         ports = [base_port + i for i in range(len(batch))]
         ready_ports = set()
         start_time = time.time()
-        max_wait = max(1.0, min(10.0, 0.05 * len(batch)))  # адаптивный (D5)
-        # Попытки открытия портов с повторениями (H5)
+        max_wait = max(1.0, min(10.0, 0.05 * len(batch)))
         attempt = 0
         while time.time() - start_time < max_wait and len(ready_ports) < len(ports):
             if proc.returncode is not None:
@@ -1251,41 +1236,26 @@ async def check_batch_via_singbox_async(batch: List[Proxy], base_port: int, sing
                 break
             await asyncio.sleep(0.2)
             attempt += 1
-            if attempt > 5:   # максимум 5 попыток
+            if attempt > 5:
                 break
 
-        # Теперь проверяем только те прокси, чьи порты открылись
         alive_proxies = []
-        tasks = []
         valid_indices = [i for i, p in enumerate(batch) if (base_port + i) in ready_ports]
-        # Проверка exit‑IP и HTTP для каждого
         for i in valid_indices:
             proxy = batch[i]
             port = base_port + i
-            # Сначала HTTP-проверка
             result = await multi_round_http_check_async(proxy, port)
             if result is None:
                 continue
-            # Теперь exit‑IP проверка (A1, A2)
-            # Создаём сессию для exit-IP
             connector = aiohttp_socks.ProxyConnector.from_url(f"socks5://127.0.0.1:{port}")
             async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=get_adaptive_http_timeout())) as session:
                 consensus_ok, exit_ip, extra = await check_exit_ip_and_content(session, port, result)
                 if consensus_ok and exit_ip:
                     result.exit_ip = exit_ip
-                    # Дополнительные проверки: exit_ip не должен совпадать с localhost или самим прокси
                     if exit_ip in ("127.0.0.1", "::1") or exit_ip == result.host:
-                        # loopback или сам себе
                         continue
-                    # Проверка на подозрительно низкий TTFB уже сделана в multi_round
-                    # Проверка warp=on и cf_loc
-                    if extra.get("warp") == "on":
-                        # WARP включён – прокси может быть цепочкой
-                        pass
-                    # Теги для OpenAI можно добавить позже
                     alive_proxies.append(result)
                 else:
-                    # exit IP не совпадает – прокси, вероятно, не работает
                     continue
 
         return alive_proxies
@@ -1303,7 +1273,6 @@ async def check_batch_via_singbox_async(batch: List[Proxy], base_port: int, sing
                     proc.kill()
                 except:
                     pass
-            # Удаляем из списка (H9)
             if proc in singbox_processes:
                 singbox_processes.remove(proc)
         if tmpfile and os.path.exists(tmpfile):
@@ -1317,7 +1286,6 @@ async def check_proxies_via_singbox_async(proxies: List[Proxy], singbox_path: st
         return []
 
     total = len(proxies)
-    # Вычисляем размер батча локально (M1)
     if total > 500:
         batch_size = min(100, int(total / 10))
     elif total > 100:
@@ -1351,7 +1319,7 @@ async def check_proxies_via_singbox_async(proxies: List[Proxy], singbox_path: st
     log.info(f"Пакетная проверка завершена: {len(alive)}/{total} живых")
     return alive
 
-# ── Score (упрощён) ─────────────────────────────────────────────────
+# ── Score ─────────────────────────────────────────────────────────────────
 
 def compute_score(proxy: Proxy) -> int:
     sec = proxy.security
@@ -1361,7 +1329,7 @@ def compute_score(proxy: Proxy) -> int:
     return max(0, min(100, int(raw_score)))
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  ЗАГРУЗКА ИСТОЧНИКОВ (исправлен retry с jitter D8)
+#  ЗАГРУЗКА ИСТОЧНИКОВ
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def fetch_source_async(url, session, retries=FETCH_SOURCE_RETRIES):
@@ -1408,19 +1376,20 @@ async def fetch_all_sources_async(urls):
     return all_u
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  CIRCUIT BREAKER с HALF-OPEN (H8)
+#  CIRCUIT BREAKER с HALF-OPEN
 # ═══════════════════════════════════════════════════════════════════════════
+
+api_failure_counters = {}
+api_circuit_open = {}
 
 def is_api_circuit_open(api_name: str) -> bool:
     if api_name not in api_circuit_open:
         return False
     if not api_circuit_open[api_name]:
         return False
-    # Если открыт, проверяем, не прошло ли достаточно времени для half-open
     if api_name in api_failure_counters:
         _, last_fail, open_time = api_failure_counters[api_name]
         if time.time() - open_time > API_HALF_OPEN_INTERVAL:
-            # Пробуем восстановить: закрываем circuit и разрешаем один запрос
             api_circuit_open[api_name] = False
             log.info(f"Circuit breaker для {api_name} переходит в half-open (попытка восстановления)")
             return False
@@ -1449,10 +1418,10 @@ def record_api_success(api_name: str):
         api_circuit_open[api_name] = False
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  ГЕОЛОКАЦИЯ (исправлена M4, M5)
+#  ГЕОЛОКАЦИЯ
 # ═══════════════════════════════════════════════════════════════════════════
 
-from collections import Counter   # вынесено наверх (M5)
+from collections import Counter
 
 async def geolocate_ips_async(proxies: List[Proxy]) -> Dict[str, Dict]:
     ips = list({p.host for p in proxies if is_ip_address(p.host)})
@@ -1572,11 +1541,10 @@ async def _geo_ipinfo(session, ips):
                 if resp.status == 200:
                     data = await resp.json()
                     if data:
-                        # Исправлено M4: country_code отдельно
                         cc = data.get("country", "XX")
                         result[ip] = {
                             "country_code": cc,
-                            "country": cc,   # можно заменить на полное имя, но оставим код
+                            "country": cc,
                             "isp": data.get("org", ""),
                             "asn": data.get("asn", ""),
                             "status": "success"
@@ -1619,11 +1587,264 @@ async def _geo_geoipdb(session, ips):
     return result
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  ИСТОРИЯ И ВЕСА (небольшие правки)
+#  ИСТОРИЯ И ВЕСА (полный класс)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class ProxyHistory:
-    # ... (код без изменений, кроме исправления M6)
+    def __init__(self, history_file=HISTORY_FILE, source_stats_file=SOURCE_STATS_FILE):
+        self.history_file = history_file
+        self.source_stats_file = source_stats_file
+        self.history = self._load_history()
+        self.source_stats = self._load_source_stats()
+
+    def _load_history(self):
+        if os.path.exists(self.history_file):
+            try:
+                with open(self.history_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                log.warning("Не удалось загрузить историю, создаём новую")
+                return {}
+        return {}
+
+    def _save_history(self):
+        try:
+            with open(self.history_file, 'w', encoding='utf-8') as f:
+                json.dump(self.history, f, indent=2)
+        except IOError as e:
+            log.error(f"Не удалось сохранить историю: {e}")
+
+    def _load_source_stats(self):
+        if os.path.exists(self.source_stats_file):
+            try:
+                with open(self.source_stats_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                log.warning("Не удалось загрузить статистику источников, создаём новую")
+                return {}
+        return {}
+
+    def _save_source_stats(self):
+        try:
+            with open(self.source_stats_file, 'w', encoding='utf-8') as f:
+                json.dump(self.source_stats, f, indent=2)
+        except IOError as e:
+            log.error(f"Не удалось сохранить статистику источников: {e}")
+
+    def _make_key(self, proxy: Proxy) -> str:
+        return f"{proxy.protocol}|{proxy.host}|{proxy.port}|{proxy.sni or ''}"
+
+    def update(self, alive_proxies: List[Proxy], all_proxies: List[Proxy], run_date=None):
+        if run_date is None:
+            run_date = datetime.now(timezone.utc).isoformat()
+
+        source_alive_count = {}
+        for p in alive_proxies:
+            src = p.source_url or "unknown"
+            source_alive_count[src] = source_alive_count.get(src, 0) + 1
+        for p in all_proxies:
+            src = p.source_url or "unknown"
+            if src not in self.source_stats:
+                self.source_stats[src] = {"total": 0, "alive": 0, "history": []}
+            self.source_stats[src]["total"] += 1
+
+        for src, count in source_alive_count.items():
+            if src in self.source_stats:
+                self.source_stats[src]["alive"] = count
+                self.source_stats[src]["history"].append({
+                    "date": run_date,
+                    "alive_ratio": count / self.source_stats[src]["total"] if self.source_stats[src]["total"] > 0 else 0
+                })
+                if len(self.source_stats[src]["history"]) > 30:
+                    self.source_stats[src]["history"] = self.source_stats[src]["history"][-30:]
+        self._save_source_stats()
+
+        for p in alive_proxies:
+            key = self._make_key(p)
+            if key not in self.history:
+                self.history[key] = {
+                    "first_seen": run_date,
+                    "last_seen": run_date,
+                    "appearances": 1,
+                    "last_alive": True,
+                    "protocol": p.protocol,
+                    "host": p.host,
+                    "port": p.port,
+                    "sni": p.sni or "",
+                    "credential": p.credential,
+                    "security": p.security,
+                    "transport": p.transport_type,
+                    "country": p.country_code,
+                    "tcp_latency_ms": p.tcp_latency_ms,
+                    "http_latency_ms": p.http_latency_ms,
+                    "p95_latency_ms": p.p95_latency_ms,
+                    "stress_success_rate": p.stress_success_rate,
+                    "jitter_ms": p.jitter_ms,
+                    "score": p.score,
+                    "uri": p.uri,
+                    "source_url": p.source_url or "unknown",
+                    "ema_latency": p.http_latency_ms,
+                    "last_alive_history": [True],
+                }
+            else:
+                entry = self.history[key]
+                entry["last_seen"] = run_date
+                entry["appearances"] += 1
+                entry["last_alive"] = True
+                old_ema = entry.get("ema_latency", p.http_latency_ms)
+                alpha = WEIGHT_CONFIG["ema_latency_weight"]
+                new_ema = alpha * p.http_latency_ms + (1 - alpha) * old_ema
+                entry["ema_latency"] = new_ema
+                entry["protocol"] = p.protocol
+                entry["host"] = p.host
+                entry["port"] = p.port
+                entry["sni"] = p.sni or ""
+                entry["credential"] = p.credential
+                entry["security"] = p.security
+                entry["transport"] = p.transport_type
+                entry["country"] = p.country_code
+                entry["tcp_latency_ms"] = p.tcp_latency_ms
+                entry["http_latency_ms"] = p.http_latency_ms
+                entry["p95_latency_ms"] = p.p95_latency_ms
+                entry["stress_success_rate"] = p.stress_success_rate
+                entry["jitter_ms"] = p.jitter_ms
+                entry["score"] = p.score
+                entry["uri"] = p.uri
+                entry["source_url"] = p.source_url or "unknown"
+                history_list = entry.get("last_alive_history", [])
+                history_list.append(True)
+                if len(history_list) > 30:
+                    history_list = history_list[-30:]
+                entry["last_alive_history"] = history_list
+
+        seen_keys = set(self._make_key(p) for p in alive_proxies)
+        for key in self.history:
+            if key not in seen_keys:
+                self.history[key]["last_alive"] = False
+                history_list = self.history[key].get("last_alive_history", [])
+                history_list.append(False)
+                if len(history_list) > 30:
+                    history_list = history_list[-30:]
+                self.history[key]["last_alive_history"] = history_list
+
+        cutoff = datetime.now(timezone.utc).timestamp() - 30 * 24 * 3600
+        to_remove = []
+        for key, entry in self.history.items():
+            try:
+                last_seen = datetime.fromisoformat(entry["last_seen"]).timestamp()
+                if last_seen < cutoff:
+                    to_remove.append(key)
+            except ValueError:
+                to_remove.append(key)
+        for key in to_remove:
+            del self.history[key]
+
+        self._save_history()
+
+    def compute_weight(self, entry: Dict) -> int:
+        weight = 0
+
+        sec = entry.get("security", "none")
+        weight += WEIGHT_CONFIG["security"].get(sec, 0)
+
+        proto = entry.get("protocol", "unknown")
+        weight += WEIGHT_CONFIG["protocol"].get(proto, 0)
+
+        country = entry.get("country", "XX")
+        weight += WEIGHT_CONFIG["country_boost"].get(country, 5)
+
+        latency = entry.get("ema_latency", entry.get("http_latency_ms", 0))
+        if latency > 0:
+            if latency < 50:
+                weight -= WEIGHT_CONFIG["latency_ms"]["very_good"]
+            elif latency < 150:
+                weight -= WEIGHT_CONFIG["latency_ms"]["good"]
+            elif latency < 300:
+                weight -= WEIGHT_CONFIG["latency_ms"]["average"]
+            else:
+                weight -= WEIGHT_CONFIG["latency_ms"]["poor"]
+        else:
+            weight -= WEIGHT_CONFIG["latency_ms"]["unknown"]
+
+        p95 = entry.get("p95_latency_ms", 0)
+        if p95 > 0:
+            if p95 < 80:
+                weight -= WEIGHT_CONFIG["p95_latency"]["very_good"]
+            elif p95 < 200:
+                weight -= WEIGHT_CONFIG["p95_latency"]["good"]
+            elif p95 < 400:
+                weight -= WEIGHT_CONFIG["p95_latency"]["average"]
+            else:
+                weight -= WEIGHT_CONFIG["p95_latency"]["poor"]
+
+        success_rate = entry.get("stress_success_rate", 0)
+        if success_rate > 0:
+            if success_rate > 0.9:
+                weight -= WEIGHT_CONFIG["stability"]["high"]
+            elif success_rate > 0.7:
+                weight -= WEIGHT_CONFIG["stability"]["medium"]
+            else:
+                weight -= WEIGHT_CONFIG["stability"]["low"]
+        else:
+            weight -= WEIGHT_CONFIG["stability"]["unknown"]
+
+        appearances = entry.get("appearances", 0)
+        threshold = WEIGHT_CONFIG["appearance_threshold"]
+        if appearances >= threshold:
+            bonus = (appearances - threshold) * WEIGHT_CONFIG["appearance_bonus"]
+            weight += bonus
+
+        try:
+            last_seen = datetime.fromisoformat(entry["last_seen"])
+            days_ago = (datetime.now(timezone.utc) - last_seen).days
+            weight -= days_ago * WEIGHT_CONFIG["age_penalty"]
+        except (ValueError, TypeError):
+            pass
+
+        src = entry.get("source_url", "unknown")
+        src_stats = self.source_stats.get(src, {})
+        total = src_stats.get("total", 0)
+        alive = src_stats.get("alive", 0)
+        if total > 0:
+            ratio = alive / total
+            if ratio > 0.5:
+                weight += WEIGHT_CONFIG["source_trust_bonus"]
+
+        history = entry.get("last_alive_history", [])
+        if len(history) >= 5:
+            flips = sum(1 for i in range(1, len(history)) if history[i] != history[i-1])
+            avg_flips = flips / len(history)
+            if avg_flips > 0.3:
+                weight -= WEIGHT_CONFIG["flapping_penalty"]
+
+        return max(0, weight)
+
+    def get_top30(self):
+        candidates = []
+        for key, entry in self.history.items():
+            if entry.get("appearances", 0) >= WEIGHT_CONFIG["appearance_threshold"] and entry.get("last_alive", False):
+                weight = self.compute_weight(entry)
+                candidates.append((weight, entry))
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        top30 = [entry for _, entry in candidates[:30]]
+        return top30
+
+    def get_top30_uris(self):
+        top = self.get_top30()
+        return [entry.get("uri", "") for entry in top if entry.get("uri")]
+
+    def print_top30(self, top30):
+        if not top30:
+            log.info("Нет прокси, удовлетворяющих условиям для top30.")
+            return
+        log.info("=== Топ-30 прокси по весу ===")
+        for i, entry in enumerate(top30, 1):
+            weight = self.compute_weight(entry)
+            flag = country_to_flag(entry.get("country", "XX"))
+            log.info(f"{i:2}. {flag} {entry.get('host')}:{entry.get('port')} "
+                     f"({entry.get('protocol')}, {entry.get('security')}) "
+                     f"вес={weight}, появлений={entry.get('appearances', 0)}")
+
     def write_top30(self, filename=TOP30_FILE):
         top30 = self.get_top30()
         if not top30:
@@ -1638,19 +1859,14 @@ class ProxyHistory:
                     f.write(uri + "\n")
         log.info(f"Записано {len(top30)} прокси в {filename}")
 
-    # Остальные методы без изменений
-
 # ═══════════════════════════════════════════════════════════════════════════
-#  ОСНОВНОЙ ПАЙПЛАЙН (исправлен)
+#  ОСНОВНОЙ ПАЙПЛАЙН
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def _prefilter_proxy_async(proxy: Proxy, singbox_path: str) -> Optional[Proxy]:
-    # TLS проверка (оставлена, но не критична)
     if ENABLE_TLS_CHECK:
         ok, cert_info = await asyncio.to_thread(tls_handshake_check, proxy, TLS_TIMEOUT)
         if not ok:
-            # Если TLS не удался, но это может быть vless без tls, пропускаем
-            # Реально это только для информативности
             pass
     if ENABLE_CONFIG_CHECK:
         if not await asyncio.to_thread(config_is_valid, proxy, singbox_path):
@@ -1661,7 +1877,6 @@ async def check_all_proxies_async(proxies: List[Proxy], singbox_path: str) -> Li
     if not proxies:
         return []
 
-    # TCP-проверка
     tcp_alive = []
     total = len(proxies)
     log.info(f"TCP-проверка {total} прокси ({MAX_WORKERS} воркеров)...")
@@ -1697,7 +1912,7 @@ async def check_all_proxies_async(proxies: List[Proxy], singbox_path: str) -> Li
         p.score = compute_score(p)
     return alive
 
-# ── Чтение и запись ──────────────────────────────────────────────
+# ── Чтение и запись ──────────────────────────────────────────────────────
 
 def read_input_urls(filename):
     try:
@@ -1717,7 +1932,7 @@ def print_output(proxies):
     for p in proxies:
         print(p.uri)
 
-# ── main (асинхронный) с asyncio.wait_for вместо SIGALRM (D3) ──
+# ── main (асинхронный) ──────────────────────────────────────────────────
 
 async def main_async():
     t0 = time.time()
@@ -1738,10 +1953,9 @@ async def main_async():
             parsed.append(p)
     log.info(f"Распарсено: {len(parsed)}")
 
-    # Фильтры
     parsed = [p for p in parsed if has_security(p)]
     parsed = [p for p in parsed if validate_reality_params(p)]
-    if ENABLE_IP_ONLY_FILTER:   # теперь опционально (H6)
+    if ENABLE_IP_ONLY_FILTER:
         parsed = [p for p in parsed if is_ip_only(p)]
     parsed = [p for p in parsed if not is_blacklisted(p)]
     unique = deduplicate_proxies(parsed)
@@ -1758,7 +1972,6 @@ async def main_async():
 
     alive = await check_all_proxies_async(unique, singbox_path)
 
-    # Геолокация
     geo = await geolocate_ips_async(alive)
     for p in alive:
         g = geo.get(p.host, {})
@@ -1766,7 +1979,6 @@ async def main_async():
         p.country = g.get("country", "Unknown")
         p.isp = g.get("isp", "")
         p.asn = g.get("asn", "")
-        # Определение хостинга
         asn = p.asn
         hosting_keywords = ["AMAZON", "DIGITALOCEAN", "HETZNER", "OVH", "ONLINE", "SCALEWAY", "LINODE", "VULTR", "GOOGLE-CLOUD", "MICROSOFT"]
         if any(kw in asn.upper() for kw in hosting_keywords):
@@ -1774,7 +1986,6 @@ async def main_async():
         else:
             p.is_hosting = False
 
-    # Формируем теги
     for p in alive:
         tags = []
         if p.is_hosting:
@@ -1796,12 +2007,11 @@ async def main_async():
     alive.sort(key=lambda x: x.score, reverse=True)
     write_output_txt(alive, OUTPUT_FILE)
 
-    # История
     history = ProxyHistory()
     if alive:
         log.info("Обновление истории прокси...")
         history.update(alive, unique)
-        history.write_top30(TOP30_FILE)   # только один раз (M6)
+        history.write_top30(TOP30_FILE)
         history.print_top30(history.get_top30())
     else:
         log.info("Нет живых прокси для обновления истории.")
@@ -1815,7 +2025,6 @@ async def main_async():
     log.info(f"Готово: {len(alive)} прокси → {OUTPUT_FILE}, top30 → {TOP30_FILE} за {elapsed:.1f}с")
 
 def main():
-    # Используем asyncio.wait_for с GLOBAL_TIMEOUT вместо SIGALRM (D3)
     try:
         asyncio.run(asyncio.wait_for(main_async(), timeout=GLOBAL_TIMEOUT))
     except asyncio.TimeoutError:
