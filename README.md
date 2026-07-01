@@ -4,4 +4,4 @@
 
 Весь список прокси - https://raw.githubusercontent.com/LexterS999/proxy_scraper/refs/heads/main/output.txt
 
-Топ30 часто встречающихся прокси - https://raw.githubusercontent.com/LexterS999/proxy_scraper/refs/heads/main/top30.txt
+Топ30 прокси - https://raw.githubusercontent.com/LexterS999/proxy_scraper/refs/heads/main/top30.txt
