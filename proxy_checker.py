@@ -34,17 +34,19 @@ import aiodns
 import aiofiles
 import uvloop
 import yaml
-from aiobreaker import CircuitBreaker
 from cachetools import LRUCache, TTLCache
 from httpx import AsyncClient, ConnectTimeout, TimeoutException, HTTPStatusError
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 from prometheus_client import Counter, Histogram, Gauge, start_http_server
+import aiosqlite
 
 # ============================================================================
 # Конфигурация
 # ============================================================================
 
 class Settings(BaseModel):
+    model_config = ConfigDict(env_prefix="PROXY_")
+
     sources_file: Path = Path("input.txt")
     history_db: Path = Path("history.db")
     output_file: Path = Path("output.txt")
@@ -98,14 +100,11 @@ class Settings(BaseModel):
 }
 """
 
-    class Config:
-        env_prefix = "PROXY_"
-
-    @validator("sources_file", "history_db", "output_file", "top30_file", "stats_file", "config_file")
+    @field_validator("sources_file", "history_db", "output_file", "top30_file", "stats_file", "config_file")
+    @classmethod
     def ensure_parent_exists(cls, v: Path) -> Path:
         v.parent.mkdir(parents=True, exist_ok=True)
         return v
-
 
 # ============================================================================
 # Логирование
@@ -258,7 +257,6 @@ class Proxy:
             source_url=source_url,
         )
 
-
 # ============================================================================
 # SQLite хранилище
 # ============================================================================
@@ -311,12 +309,11 @@ class ProxyDatabase:
 
     async def insert_or_update(self, proxy: Proxy, check_result: dict):
         """Вставить или обновить запись о прокси"""
-        import sqlite3
         fingerprint = proxy.fingerprint()
         now = datetime.utcnow().isoformat()
         uri = proxy.to_uri()
         params_json = json.dumps(proxy.params)
-        async with aiofiles.sqlite3.connect(self.db_path) as conn:
+        async with aiosqlite.connect(self.db_path) as conn:
             await conn.execute("""
                 INSERT INTO proxies (
                     fingerprint, protocol, host, port, sni, credential, security, transport,
@@ -368,8 +365,7 @@ class ProxyDatabase:
 
     async def get_top30(self) -> List[Proxy]:
         """Получить 30 лучших по скору и времени жизни"""
-        import sqlite3
-        async with aiofiles.sqlite3.connect(self.db_path) as conn:
+        async with aiosqlite.connect(self.db_path) as conn:
             cursor = await conn.execute("""
                 SELECT protocol, host, port, sni, credential, security, transport, params, source_url
                 FROM proxies
@@ -397,8 +393,7 @@ class ProxyDatabase:
 
     async def get_stats(self) -> dict:
         """Статистика по источникам"""
-        import sqlite3
-        async with aiofiles.sqlite3.connect(self.db_path) as conn:
+        async with aiosqlite.connect(self.db_path) as conn:
             cursor = await conn.execute("""
                 SELECT source_url, COUNT(*) as total,
                        SUM(last_alive) as alive
@@ -413,12 +408,10 @@ class ProxyDatabase:
 
     async def prune_old(self, days: int = 7):
         """Удалить старые неактивные записи"""
-        import sqlite3
         threshold = (datetime.utcnow() - timedelta(days=days)).isoformat()
-        async with aiofiles.sqlite3.connect(self.db_path) as conn:
+        async with aiosqlite.connect(self.db_path) as conn:
             await conn.execute("DELETE FROM proxies WHERE last_alive = 0 AND last_seen < ?", (threshold,))
             await conn.commit()
-
 
 # ============================================================================
 # Проверка прокси (через sing-box)
@@ -432,11 +425,6 @@ class ProxyChecker:
         # Кеш DNS
         self.dns_cache = TTLCache(maxsize=1000, ttl=settings.dns_cache_ttl)
         self.resolver = aiodns.DNSResolver()
-        # Circuit breaker для geo-API
-        self.geo_breaker = CircuitBreaker(
-            failure_threshold=settings.geo_api_circuit_breaker_threshold,
-            recovery_timeout=settings.circuit_breaker_recovery_timeout,
-        )
         # HTTP клиент с пулом соединений
         self.client = AsyncClient(
             timeout=TimeoutException(
@@ -582,7 +570,6 @@ class ProxyChecker:
     async def close(self):
         await self.client.aclose()
 
-
 # ============================================================================
 # Сбор данных
 # ============================================================================
@@ -630,116 +617,4 @@ class ProxyScraper:
                 await asyncio.sleep(wait)
             except Exception as e:
                 logger.error(f"Unexpected error fetching {url}: {e}")
-                SOURCE_FETCH_FAILURES.labels(source_url=url).inc()
-                break
-        return []
-
-    async def process_sources(self, urls: List[str]) -> AsyncIterator[Proxy]:
-        """Загрузить все источники и выдавать прокси"""
-        seen_fingerprints = set()
-        for url in urls:
-            logger.info(f"Fetching source: {url}")
-            uris = await self.fetch_source(url)
-            for uri in uris:
-                try:
-                    proxy = Proxy.from_uri(uri, source_url=url)
-                    fp = proxy.fingerprint()
-                    if fp not in seen_fingerprints:
-                        seen_fingerprints.add(fp)
-                        yield proxy
-                except Exception:
-                    continue
-
-    async def run(self):
-        """Основной цикл"""
-        logger.info("Starting proxy scraper v2.0")
-        # Загружаем источники
-        source_urls = await self.load_sources()
-        logger.info(f"Loaded {len(source_urls)} sources")
-
-        # Собираем все прокси
-        all_proxies = []
-        async for proxy in self.process_sources(source_urls):
-            all_proxies.append(proxy)
-        logger.info(f"Collected {len(all_proxies)} unique proxies")
-
-        if not all_proxies:
-            logger.warning("No proxies found, exiting")
-            return
-
-        # Проверяем пачками
-        batch_size = 50
-        results = []
-        for i in range(0, len(all_proxies), batch_size):
-            batch = all_proxies[i:i+batch_size]
-            batch_results = await self.checker.check_batch(batch)
-            results.extend(batch_results)
-
-        # Сохраняем в БД и формируем выходные файлы
-        alive_proxies = []
-        for proxy, check in results:
-            await self.db.insert_or_update(proxy, check)
-            if check.get("alive"):
-                alive_proxies.append(proxy)
-
-        # Обновляем output.txt и top30.txt
-        await self._write_output(alive_proxies)
-        await self._write_top30()
-
-        # Статистика источников
-        stats = await self.db.get_stats()
-        async with aiofiles.open(self.settings.stats_file, "w") as f:
-            await f.write(json.dumps(stats, indent=2))
-
-        logger.info(f"Done. Alive: {len(alive_proxies)}, total checked: {len(results)}")
-
-    async def _write_output(self, proxies: List[Proxy]):
-        """Записать все живые прокси в output.txt (URI)"""
-        async with aiofiles.open(self.settings.output_file, "w") as f:
-            for p in proxies:
-                await f.write(p.to_uri() + "\n")
-
-    async def _write_top30(self):
-        """Записать 30 лучших прокси в top30.txt"""
-        top = await self.db.get_top30()
-        async with aiofiles.open(self.settings.top30_file, "w") as f:
-            for p in top:
-                await f.write(p.to_uri() + "\n")
-
-    async def close(self):
-        await self.checker.close()
-
-
-# ============================================================================
-# Точка входа
-# ============================================================================
-
-def load_config() -> Settings:
-    """Загрузить настройки из config.yaml и переменных окружения"""
-    config_path = Path("config.yaml")
-    if config_path.exists():
-        with open(config_path) as f:
-            data = yaml.safe_load(f) or {}
-    else:
-        data = {}
-    # Переопределяем из .env (через pydantic поддерживает)
-    return Settings(**data)
-
-
-async def main():
-    # Принудительно используем uvloop
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-
-    settings = load_config()
-    # Запускаем сервер метрик (если нужно)
-    # start_http_server(8000)
-
-    scraper = ProxyScraper(settings)
-    try:
-        await scraper.run()
-    finally:
-        await scraper.close()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+                SOURCE_FETCH_FAILURES
