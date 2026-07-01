@@ -3,7 +3,7 @@ name: Proxy Check
 on:
   schedule:
     - cron: '0 */2 * * *'
-  workflow_dispatch:
+  workflow_dispatch:          # ручной запуск
 
 permissions:
   contents: write
@@ -21,6 +21,7 @@ jobs:
         with:
           python-version: '3.12'
 
+      # Кеш для pip – ускоряет установку зависимостей
       - name: Cache pip packages
         uses: actions/cache@v4
         with:
@@ -32,6 +33,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # Кеш для sing-box – бинарник скачивается один раз и переиспользуется
       - name: Cache sing-box
         uses: actions/cache@v4
         id: cache-singbox
@@ -39,17 +41,13 @@ jobs:
           path: /tmp/sing-box
           key: ${{ runner.os }}-singbox-v1.12.19
 
-      - name: Download sing-box if not cached
-        if: steps.cache-singbox.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p /tmp/sing-box
-          cd /tmp/sing-box
-          wget -q https://github.com/SagerNet/sing-box/releases/download/v1.12.19/sing-box-1.12.19-linux-amd64.tar.gz
-          tar -xzf sing-box-*.tar.gz
-          mv sing-box-*/sing-box .
-          chmod +x sing-box
+      # Если кеш отсутствует, скрипт скачает его сам при первом запуске,
+      # но мы можем явно создать директорию, чтобы кеш сохранился
+      - name: Prepare sing-box cache directory
+        run: mkdir -p /tmp/sing-box
 
-      - name: Create config.yaml if missing
+      # Создаём пустой config.yaml, если его нет (скрипт не требует, но для порядка)
+      - name: Ensure config.yaml exists
         run: |
           if [ ! -f config.yaml ]; then
             echo "{}" > config.yaml
@@ -58,34 +56,13 @@ jobs:
       - name: Run proxy checker
         run: python proxy_checker.py
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: proxy-results
-          path: |
-            output.txt
-            top30.txt
-            history.db
-            source_stats.json
-          retention-days: 7
-
+      # Коммитим все файлы, которые могут измениться
       - name: Commit updated files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Гарантируем наличие history.db
-          touch history.db
+          git add output.txt top30.txt history.json source_stats.json config.yaml
 
-          # Добавляем только существующие файлы
-          for file in output.txt top30.txt history.db source_stats.json config.yaml; do
-            if [ -f "$file" ]; then
-              git add "$file"
-            fi
-          done
-
-          # Коммитим, только если есть изменения
-          git diff --staged --quiet || {
-            git commit -m "Update proxy lists and history [skip ci]"
-            git push
-          }
+          git diff --staged --quiet || git commit -m "Update proxy lists and history [skip ci]"
+          git push
