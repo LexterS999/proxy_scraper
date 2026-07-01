@@ -49,13 +49,18 @@ jobs:
       - name: Run proxy checker
         run: python proxy_checker.py
 
-      # Коммитим все файлы, которые могут измениться
+      # Коммитим только те файлы, которые действительно создаются скриптом
       - name: Commit updated files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add output.txt top30.txt history.json source_stats.json config.yaml
+          # Добавляем только существующие файлы, чтобы избежать ошибок
+          for file in output.txt top30.txt history.json source_stats.json; do
+            if [ -f "$file" ]; then
+              git add "$file"
+            fi
+          done
 
           git diff --staged --quiet || git commit -m "Update proxy lists and history [skip ci]"
           git push
