@@ -37,3 +37,4 @@ https://raw.githubusercontent.com/FLAT447/v2ray-lists/refs/heads/main/WHITE_FULL
 https://raw.githubusercontent.com/nikita29a/FreeProxyList/refs/heads/main/mirror/1.txt
 https://raw.githubusercontent.com/ByeWhiteLists/ByeWhiteLists2/refs/heads/main/ByeWhiteLists2.txt
 https://raw.githubusercontent.com/Alirewa/V2ray-Configs/main/config.txt
+https://raw.githubusercontent.com/whoahaow/rjsxrd/refs/heads/main/githubmirror/bypass/bypass-all.txt
