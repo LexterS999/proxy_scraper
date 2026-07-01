@@ -74,42 +74,37 @@ CONFIG_FILE = "config.yaml"
 SOURCE_STATS_FILE = "source_stats.json"
 
 # ---- Таймауты (сек) ----
-CONNECT_TIMEOUT = 2.0
-HTTP_TEST_TIMEOUT = 3.0
-SINGBOX_STARTUP_WAIT = 3.0
+CONNECT_TIMEOUT = 5.0
+HTTP_TEST_TIMEOUT = 10.0
+SINGBOX_STARTUP_WAIT = 10.0
 FETCH_SOURCE_TIMEOUT = 30.0
 GEO_API_TIMEOUT = 15.0
-TCP_RETRY_DELAY = 0.3
-GLOBAL_TIMEOUT = 1600
+TCP_RETRY_DELAY = 1.0
+GLOBAL_TIMEOUT = 6000
 
 # ---- TLS-проверка (ОТКЛЮЧЕНА) ----
-ENABLE_TLS_CHECK = False          # <-- ОТКЛЮЧЕНО
+ENABLE_TLS_CHECK = False
 TLS_TIMEOUT = 1.0
 
 # ---- Параллелизм (адаптивный) ----
 CPU_COUNT = os.cpu_count() or 2
 
 # ---- HTTP-проверка (исправлено H1, H2) ----
-HTTP_ROUNDS = 2                     # теперь реально два раунда (с задержкой)
+HTTP_ROUNDS = 1
 HTTP_ROUND_GAP = 45.0
-GENERAL_SUCCESS_THRESHOLD = 0.5     # <-- СНИЖЕНО (было 0.9)
-STREAMING_SUCCESS_THRESHOLD = 0.3   # <-- СНИЖЕНО (было 0.5)
+GENERAL_SUCCESS_THRESHOLD = 0.2 
+STREAMING_SUCCESS_THRESHOLD = 0.1
 
 HTTP_TARGETS_GENERAL = [
-    ("http://www.gstatic.com/generate_204", 204, b""),
-    ("https://www.cloudflare.com/cdn-cgi/trace", 200, None),   # проверка тела отдельно
-]
-HTTP_TARGETS_SPECIFIC = [
-    ("https://www.youtube.com", 200, None, "youtube"),
-    ("https://www.netflix.com", 200, None, "netflix"),
-    # ("https://chat.openai.com/cdn-cgi/trace", 200, None, "openai"),
+    ("http://connectivitycheck.gstatic.com/generate_204", 204, b""),
+    ("https://1.1.1.1/cdn-cgi/trace", 200, None),
 ]
 
 # ---- Стресс-тест (исправлено H4) ----
 STRESS_CONNECTIONS = 5
 
 # ---- Предфильтрация (ОТКЛЮЧЕНА) ----
-ENABLE_CONFIG_CHECK = False        # <-- ОТКЛЮЧЕНО
+ENABLE_CONFIG_CHECK = False
 ENABLE_IP_ONLY_FILTER = False      # теперь домены не отбрасываются (H6)
 
 # ---- Exit-IP триангуляция (ОТКЛЮЧЕНА по умолчанию) ----
@@ -732,10 +727,10 @@ async def update_adaptive_timeout_async(latencies: List[float]):
         log.debug(f"Адаптивный таймаут обновлён: {new_median:.0f}ms")
 
 def get_adaptive_http_timeout():
-    return max(3.0, min(15.0, _median_latency / 1000 * 2.5))  # <-- УВЕЛИЧЕНО
+    return max(5.0, min(30.0, _median_latency / 1000 * 2.5))
 
 def get_adaptive_connect_timeout():
-    return max(2.0, min(8.0, _median_latency / 1000 * 2.0))   # <-- УВЕЛИЧЕНО
+    return max(3.0, min(15.0, _median_latency / 1000 * 2.0))
 
 # ── TCP и стресс-тест ──────────────────────────────────────────────────
 
