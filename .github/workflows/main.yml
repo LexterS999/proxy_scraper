@@ -32,8 +32,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # добавляем только output.txt и history.json
-          git add output.txt history.json
+          # добавляем все файлы, которые могут измениться
+          git add output.txt top30.txt history.json
 
           # если есть изменения – коммитим
           git diff --staged --quiet || git commit -m "Update proxy lists and history [skip ci]"
